@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emaldo"
+version = "0.1.0"
+description = "Python client library for Emaldo home battery systems"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+    "pycryptodome>=3.15",
+    "cramjam>=2.6",
+]
+
+[project.scripts]
+emaldo = "emaldo.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["emaldo*"]
+
+[tool.ruff]
+line-length = 100

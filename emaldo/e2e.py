@@ -1474,7 +1474,13 @@ def set_peak_shaving_redundancy(
 # track state optimistically in the caller.
 
 EV_MODE_LOWEST_PRICE = 1       # Smart: charge during cheapest grid hours
-EV_MODE_SOLAR_ONLY = 2         # Smart: charge only from surplus PV
+EV_MODE_SOLAR_ONLY = 2         # Smart: charge only from surplus PV — defined
+                               # in the APK's Mcu.EVChargingMode enum but
+                               # NOT surfaced in the current Android app UI
+                               # (at least on PC1-BAK15-HS10). The wire
+                               # protocol accepts it, but callers should
+                               # treat it as unsupported unless verified
+                               # against their specific hardware.
 EV_MODE_SCHEDULED = 3          # Smart: charge on a weekday/weekend schedule
 EV_MODE_INSTANT_FULL = 4       # Instant: charge flat-out until the car is full
 EV_MODE_INSTANT_FIXED = 5      # Instant: charge exactly ``fixed`` kWh then stop

@@ -216,7 +216,7 @@ def cmd_battery(args):
 
     if isinstance(bat_data, dict):
         entries = bat_data.get("data", [])
-        total_charged = sum(e[3] + e[4] for e in entries if len(e) >= 5) * 5 / 60
+        total_charged = sum(e[2] + e[3] for e in entries if len(e) >= 4) * 5 / 60
         total_discharged = sum(e[1] for e in entries if len(e) >= 2) * 5 / 60
         print(f"  Charged today:    {total_charged/1000:.1f} kWh")
         print(f"  Discharged today: {total_discharged/1000:.1f} kWh")
@@ -315,7 +315,7 @@ def cmd_usage(args):
 
     if isinstance(bat, dict):
         entries = bat.get("data", [])
-        total_charged = sum(e[3] + e[4] for e in entries if len(e) >= 5) * interval / 60 / 1000
+        total_charged = sum(e[2] + e[3] for e in entries if len(e) >= 4) * interval / 60 / 1000
         total_discharged = sum(e[1] for e in entries if len(e) >= 2) * interval / 60 / 1000
         net = total_charged - total_discharged
         print(f"  Battery-Net: {abs(net):.1f} kWh ({'charged' if net > 0 else 'discharged'}),"

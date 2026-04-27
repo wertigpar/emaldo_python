@@ -28,6 +28,7 @@ this implementation.
 - **Sell to grid** — Manual sell (discharge-to-grid) command via E2E
 - **Emergency charge** — Force-charge the battery via E2E
 - **Peak shaving** — Full peak shaving control via E2E (toggle, reserves, schedule, all-day, redundancy)
+- **Grid frequency regulation** — Read FCR/mFRR balancing state via E2E
 - **Usage analytics** — Solar, grid, battery, and revenue data
 
 ## Installation
@@ -168,6 +169,10 @@ emaldo peak-shaving --schedule 06:00-22:00 5000 Mon,Wed,Fri      # Set schedule
 emaldo peak-shaving --schedule 06:00-22:00 5000 Mon-Fri --all-day  # All-day mode
 emaldo peak-shaving --no-all-day                                 # Disable all-day
 emaldo peak-shaving --redundancy 1                               # Set redundancy
+
+# Grid frequency regulation (balancing) state
+emaldo balancing-state                  # Show current state (idle/pre_balancing/balancing/balancing_failed)
+emaldo balancing-state --json           # Raw JSON output
 ```
 
 ### Library
@@ -275,6 +280,7 @@ client = EmaldoClient(session=session)
 | `set_peak_shaving_points(home_id, ..., peak_pct, ups_pct)` | Set peak/UPS reserve percentages |
 | `set_peak_shaving_schedule(home_id, ..., id, start, end, days, power, all_day)` | Set peak shaving schedule |
 | `set_peak_shaving_redundancy(home_id, ..., redundancy)` | Set redundancy value |
+| `get_regulate_frequency_state(home_id, device_id, model)` | Read grid frequency regulation (balancing) state via E2E |
 | `get_region(home_id, device_id, model)` | Device region info |
 | `get_contract(home_id)` | Balance contract info |
 | `get_features(home_id, device_id, model)` | Device feature flags |
@@ -330,6 +336,7 @@ The 7 standard override actions map to slot values using the configured markers 
 | `sell` | Sell (discharge-to-grid) via E2E (`--hours`, `--until`, `--cancel`) |
 | `emergency-charge` | Emergency charge via E2E (`--hours`, `--until`, `--cancel`) |
 | `peak-shaving` | Peak shaving via E2E (`--show`, `--enable`, `--disable`, `--peak-reserve`, `--ups-reserve`, `--schedule`, `--all-day`, `--no-all-day`, `--redundancy`) |
+| `balancing-state` | Grid frequency regulation (balancing) state via E2E (`--json`, `--verbose`) |
 | `region` | Region info |
 | `contract` | Contract info |
 | `features` | Feature flags |

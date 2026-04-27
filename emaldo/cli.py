@@ -615,6 +615,60 @@ def cmd_power_e2e(args):
     print(f"  {C_DIM}Grid valid: {gv}  BSensor valid: {bv}{C_R}")
 
 
+def cmd_balancing_state(args):
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    def e2e_log(msg: str):
+        if args.verbose:
+            print(f"  [E2E] {msg}", file=sys.stderr)
+
+    print("Reading balancing state via E2E (type 0x45)...", file=sys.stderr)
+    data = client.get_regulate_frequency_state(home_id, device_id, model, log=e2e_log)
+
+    if args.json_output:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return
+
+    if not data:
+        if args.verbose:
+            print("  [DEBUG] Possible causes: session conflict, timeout, or "
+                  "decrypt failed. See E2E log above.", file=sys.stderr)
+        print("No balancing state data received (device did not respond or decrypt failed).")
+        return
+
+    use_color = sys.stdout.isatty()
+    if use_color:
+        C_HDR, C_OK, C_WARN, C_DIM, C_ERR, C_R = (
+            "\033[1m", "\033[32m", "\033[33m", "\033[90m", "\033[31m", "\033[0m"
+        )
+    else:
+        C_HDR = C_OK = C_WARN = C_DIM = C_ERR = C_R = ""
+
+    display = data.get("display", "unknown")
+    state_name = data.get("state_name", "?")
+    state = data.get("state", -1)
+    has_error = data.get("has_error")
+
+    _ACTIVE_STATES = {"fcr_n", "fcr_d_up", "fcr_d_down", "fcr_d_up_down", "mfrr_up", "mfrr_down"}
+    if display == "balancing_failed":
+        display_col = f"{C_ERR}balancing_failed{C_R}"
+    elif display in _ACTIVE_STATES:
+        display_col = f"{C_OK}{display}{C_R}"
+    elif display == "pre_balancing":
+        display_col = f"{C_WARN}pre_balancing{C_R}"
+    else:
+        display_col = display
+
+    print(f"{C_HDR}Grid Frequency Regulation (Balancing) State{C_R}")
+    print(f"  Display:     {display_col}")
+    print(f"  State:       {state_name} ({state})")
+    if has_error is not None:
+        err_str = f"{C_ERR}{has_error}{C_R}" if has_error != 1 else f"{C_DIM}{has_error}{C_R}"
+        print(f"  Has error:   {err_str}")
+
+
 def cmd_power_debug(args):
     import json as _json
     client = load_client(args)
@@ -1571,6 +1625,10 @@ Examples:
     p_pe2e.add_argument("-v", "--verbose", action="store_true", help="Show E2E session details")
     p_pe2e.add_argument("--json", dest="json_output", action="store_true", help="Output raw JSON")
 
+    p_bs = sub.add_parser("balancing-state", help="Grid frequency regulation (balancing) state via E2E")
+    p_bs.add_argument("-v", "--verbose", action="store_true", help="Show E2E session details")
+    p_bs.add_argument("--json", dest="json_output", action="store_true", help="Output raw JSON")
+
     sub.add_parser("power-debug", help="Dump raw /bmt/list-bmt/ device data (same API the app uses)")
 
     p_solar = sub.add_parser("solar", help="Solar/MPPT generation stats")
@@ -1647,6 +1705,7 @@ Examples:
         "strategy": cmd_strategy, "sell": cmd_sell,
         "emergency-charge": cmd_emergency_charge, "override": cmd_override,
         "peak-shaving": cmd_peak_shaving,
+        "balancing-state": cmd_balancing_state,
         "region": cmd_region, "contract": cmd_contract, "features": cmd_features,
         "raw": cmd_raw, "encrypt": cmd_encrypt, "decrypt": cmd_decrypt,
         "version-check": cmd_version_check, "power-debug": cmd_power_debug,

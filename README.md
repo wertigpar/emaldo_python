@@ -171,7 +171,7 @@ emaldo peak-shaving --no-all-day                                 # Disable all-d
 emaldo peak-shaving --redundancy 1                               # Set redundancy
 
 # Grid frequency regulation (balancing) state
-emaldo balancing-state                  # Show current state (idle/pre_balancing/balancing/balancing_failed)
+emaldo balancing-state                  # Show current state (idle/pre_balancing/fcr_n/fcr_d_up/fcr_d_down/fcr_d_up_down/mfrr_up/mfrr_down/balancing_failed)
 emaldo balancing-state --json           # Raw JSON output
 ```
 

@@ -610,6 +610,11 @@ def cmd_power_e2e(args):
     if other:
         print(f"  Backup Box:  {other} W")
 
+    tp_pv = data.get("thirdparty_pv_on")
+    if tp_pv is not None:
+        tp_str = "on" if tp_pv else "off"
+        print(f"  3rd-party PV: {C_OK if tp_pv else C_DIM}{tp_str}{C_R}")
+
     gv = data.get("grid_valid", False)
     bv = data.get("bsensor_valid", False)
     print(f"  {C_DIM}Grid valid: {gv}  BSensor valid: {bv}{C_R}")
@@ -1379,6 +1384,31 @@ def _parse_days(text: str) -> int:
     return bitmask
 
 
+def cmd_third_party_pv(args):
+    """Handle the 'third-party-pv' subcommand."""
+    client = load_client(args)
+    home_id = get_home_id(args, client)
+    device_id, model = get_device_id(args, client, home_id)
+
+    if args.on == args.off:
+        print("Specify exactly one of --on or --off.", file=sys.stderr)
+        sys.exit(1)
+
+    enabled = args.on
+    try:
+        ok = client.set_third_party_pv(home_id, device_id, model, enabled)
+    except (EmaldoE2EError, EmaldoAPIError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    label = "on" if enabled else "off"
+    if ok:
+        print(f"Third-party PV turned {label}.")
+    else:
+        print(f"Command sent but no acknowledgement received.", file=sys.stderr)
+        sys.exit(1)
+
+
 def cmd_peak_shaving(args):
     """Handle the 'peak-shaving' subcommand."""
     client = load_client(args)
@@ -1660,6 +1690,10 @@ Examples:
                             help="Set battery markers (e.g. --markers 20 72)")
     p_override.add_argument("--dry-run", action="store_true", help="Build without sending")
 
+    p_tp = sub.add_parser("third-party-pv", help="Enable or disable third-party PV input via E2E")
+    p_tp.add_argument("--on", action="store_true", default=False, help="Enable third-party PV")
+    p_tp.add_argument("--off", action="store_true", default=False, help="Disable third-party PV")
+
     p_ps = sub.add_parser("peak-shaving", help="Peak shaving config & schedule via E2E")
     p_ps.add_argument("--show", action="store_true", help="Show current peak shaving state (default)")
     p_ps.add_argument("--enable", action="store_true", help="Enable peak shaving")
@@ -1704,6 +1738,7 @@ Examples:
         "power": cmd_power, "solar": cmd_solar, "grid": cmd_grid,
         "strategy": cmd_strategy, "sell": cmd_sell,
         "emergency-charge": cmd_emergency_charge, "override": cmd_override,
+        "third-party-pv": cmd_third_party_pv,
         "peak-shaving": cmd_peak_shaving,
         "balancing-state": cmd_balancing_state,
         "region": cmd_region, "contract": cmd_contract, "features": cmd_features,

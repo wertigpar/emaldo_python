@@ -15,10 +15,13 @@ Usage::
 """
 
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+_LOGGER = logging.getLogger(__name__)
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -157,6 +160,24 @@ class EmaldoClient:
         # Cache E2E login credentials to avoid the 3 REST round-trips that
         # e2e_login() performs on every single E2E operation.
         self._e2e_credential_ttl = 10 * 60  # seconds; tune after field testing
+        # Account-level /home/e2e-login/ result, cached per home_id. That
+        # endpoint rotates the shared home end_secret server-side, so running
+        # it inside every per-device e2e_login rotates it out from under the
+        # OTHER device's live session on a multi-device account — a mutual
+        # 21204 storm that stalls both stream and poll mode (#47). Caching it
+        # per account keeps one home generation valid for all device sessions.
+        self._home_e2e_cache: dict[str, tuple[dict, float]] = {}
+        self._home_e2e_ttl = 30 * 60  # seconds
+        # Per-home serialization lock: prevents concurrent /home/e2e-login/
+        # calls for the same home_id from racing and each rotating the shared
+        # home end_secret server-side, which would kill the OTHER device's
+        # live session on multi-device accounts (#47).
+        self._home_e2e_locks: dict[str, threading.Lock] = {}
+        # Home secret rotation callbacks: registered by live
+        # PersistentE2ESession instances so they can re-key their home-level
+        # credentials (home_end_id/group_id/end_secret) when the shared home
+        # secret is rotated, instead of having the relay force-logout them.
+        self._home_secret_callbacks: dict[str, list[Callable[[dict], None]]] = {}
 
     # ------------------------------------------------------------------
     # Session management
@@ -722,23 +743,155 @@ class EmaldoClient:
     # E2E override protocol
     # ------------------------------------------------------------------
 
-    def e2e_login(self, home_id: str, device_id: str, model: str) -> dict:
+    def _get_home_e2e(self, home_id: str, *, force_refresh: bool = False) -> dict:
+        """Return the account-level ``/home/e2e-login/`` result, cached per home.
+
+        This endpoint is per-account (``home_id``) and rotates the shared home
+        ``end_secret`` server-side on every call. Because that secret is baked
+        into the ``home_alive`` keepalive/handshake packets of *every* device
+        session on the account, re-running it inside each per-device
+        ``e2e_login`` expires the other device's live session (mutual 21204
+        storm — #47). Caching it per account keeps a single home generation
+        valid for all of the account's device sessions; only the device-level
+        login (which rotates the per-device ``chat_secret``) stays per-call.
+        """
+        now = time.monotonic()
+
+        # Fast path: check cache brief under global e2e_lock.
+        with self._e2e_lock:
+            cached = self._home_e2e_cache.get(home_id)
+            if (
+                not force_refresh
+                and cached is not None
+                and now - cached[1] <= self._home_e2e_ttl
+            ):
+                return dict(cached[0])
+
+        # Slow path: acquire per-home lock to serialize concurrent
+        # /home/e2e-login/ calls for the same home_id across
+        # threads/coordinator instances (#47).
+        home_lock = self._home_e2e_locks.setdefault(home_id, threading.Lock())
+        with home_lock:
+            # Double-check cache: another thread may have refreshed while we
+            # were waiting on the per-home lock.  If the cache was updated
+            # within the last 5 s we reuse it even when *force_refresh* is
+            # set — this prevents back-to-back /home/e2e-login/ rotations
+            # when two devices on the same account both escalate (#47).
+            with self._e2e_lock:
+                cached = self._home_e2e_cache.get(home_id)
+                if cached is not None:
+                    age = time.monotonic() - cached[1]
+                    if (
+                        not force_refresh
+                        and age <= self._home_e2e_ttl
+                    ):
+                        return dict(cached[0])
+                    if force_refresh and age < 5:
+                        _LOGGER.debug(
+                            "Home e2e cache %ds fresh — reusing for home_id=%s "
+                            "(age < 5s window, replaying latest secret to avoid "
+                            "dual-unit ping-pong)",
+                            int(age), home_id,
+                        )
+                        # Fire callbacks so late-registered sessions still
+                        # learn about the new secret.
+                        _callbacks = list(
+                            self._home_secret_callbacks.get(home_id, [])
+                        )
+                        # Release per-home lock before firing to avoid
+                        # deadlock (callbacks may acquire e2e locks).
+                        # (will be released by `with` context manager exit)
+                        for cb in _callbacks:
+                            try:
+                                cb(dict(cached[0]))
+                            except Exception:
+                                _LOGGER.exception(
+                                    "Home secret callback failed for "
+                                    "home_id=%s",
+                                    home_id,
+                                )
+                        return dict(cached[0])
+
+            home_result = self.api_request(
+                "/home/e2e-login/", json_data={"home_id": home_id}
+            )
+            home_data = home_result.get("Result", {})
+            if not isinstance(home_data, dict) or "end_id" not in home_data:
+                raise EmaldoE2EError(f"Home e2e-login failed: {home_result}")
+
+            with self._e2e_lock:
+                self._home_e2e_cache[home_id] = (dict(home_data), time.monotonic())
+
+            # Collect callbacks while still holding per-home lock so a
+            # concurrent re-register cannot mutate the list mid-iteration.
+            callbacks = list(self._home_secret_callbacks.get(home_id, []))
+
+        # Fire callbacks outside the `with home_lock:` block (but still
+        # inside the slow-path block — same indentation level) to avoid
+        # deadlock (callbacks may acquire e2e locks themselves).
+        for cb in callbacks:
+            try:
+                cb(dict(home_data))
+            except Exception:
+                _LOGGER.exception(
+                    "Home secret callback failed for home_id=%s", home_id
+                )
+
+        return dict(home_data)
+
+    def invalidate_home_e2e(self, home_id: str) -> None:
+        """Drop the cached account-level home login (forces a fresh fetch)."""
+        with self._e2e_lock:
+            self._home_e2e_cache.pop(home_id, None)
+
+    def register_home_secret_callback(
+        self, home_id: str, callback: Callable[[dict], None]
+    ) -> Callable[[], None]:
+        """Register a callback invoked when the home secret is rotated.
+
+        The callback receives the fresh ``/home/e2e-login/`` result dict.
+        Returns an unregister callable.
+        """
+        self._home_secret_callbacks.setdefault(home_id, []).append(callback)
+        _LOGGER.debug(
+            "Home secret callback registered for home_id=%s (%d total)",
+            home_id, len(self._home_secret_callbacks[home_id]),
+        )
+
+        def _unregister():
+            try:
+                self._home_secret_callbacks[home_id].remove(callback)
+                if not self._home_secret_callbacks[home_id]:
+                    del self._home_secret_callbacks[home_id]
+            except (KeyError, ValueError):
+                pass
+
+        return _unregister
+
+    def e2e_login(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        force_home_refresh: bool = False,
+    ) -> dict:
         """Perform E2E login to obtain UDP session credentials.
 
         Calls three API endpoints (home e2e-login, device e2e-user-login,
         search-bmt) and returns a credentials dict for E2E operations.
 
+        The account-level home e2e-login is cached per ``home_id`` (see
+        :meth:`_get_home_e2e`) so a per-device login does not rotate the shared
+        home secret out from under another device's live session. Pass
+        ``force_home_refresh=True`` only for a deliberate account-level refresh.
+
         Raises:
             EmaldoAuthError: Auth issue during E2E login.
             EmaldoE2EError: Missing fields in API response.
         """
-        # Step 1: Home E2E login
-        home_result = self.api_request(
-            "/home/e2e-login/", json_data={"home_id": home_id}
-        )
-        home_data = home_result.get("Result", {})
-        if not isinstance(home_data, dict) or "end_id" not in home_data:
-            raise EmaldoE2EError(f"Home e2e-login failed: {home_result}")
+        # Step 1: Home E2E login (cached per account).
+        home_data = self._get_home_e2e(home_id, force_refresh=force_home_refresh)
 
         # Step 2: Device E2E login
         dev_result = self.api_request(
@@ -820,6 +973,34 @@ class EmaldoClient:
         with self._e2e_lock:
             self._e2e_creds_cache.pop(key, None)
 
+    def get_e2e_credentials(
+        self,
+        home_id: str,
+        device_id: str,
+        model: str,
+        *,
+        force_refresh: bool = False,
+        allow_home_refresh: bool = True,
+    ) -> dict:
+        """Public accessor for the shared, cached E2E credentials.
+
+        All E2E consumers (the realtime stream session and the periodic REST/EV
+        reads) MUST use this rather than calling :meth:`e2e_login` directly:
+        ``e2e_login`` rotates the device ``chat_secret`` server-side, which
+        expires any other live UDP session and triggers a 21204 storm. Sharing
+        one cached credential generation keeps a single ``chat_secret`` valid
+        for all consumers (refreshed only on the TTL or an explicit
+        ``force_refresh`` after a confirmed session expiry).
+
+        If *allow_home_refresh* is ``False`` (secondary device), the escalation
+        to ``force_home_refresh=True`` is suppressed — the secondary must never
+        rotate the shared home secret independently (#47 Phase 4).
+        """
+        return self._get_e2e_credentials(
+            home_id, device_id, model,
+            force_refresh=force_refresh, allow_home_refresh=allow_home_refresh,
+        )
+
     def _get_e2e_credentials(
         self,
         home_id: str,
@@ -827,12 +1008,13 @@ class EmaldoClient:
         model: str,
         *,
         force_refresh: bool = False,
+        allow_home_refresh: bool = True,
     ) -> dict:
         """Return cached E2E credentials, refreshing them when needed."""
-        key = self._e2e_key(home_id, device_id, model)
         now = time.monotonic()
 
         with self._e2e_lock:
+            key = self._e2e_key(home_id, device_id, model)
             entry = self._e2e_creds_cache.get(key)
             expired = (
                 entry is None
@@ -840,7 +1022,38 @@ class EmaldoClient:
             )
 
             if force_refresh or expired:
-                creds = self.e2e_login(home_id, device_id, model)
+                # A forced refresh fires after a confirmed session expiry or
+                # decrypt failure for THIS device. The home-level secret is
+                # shared across ALL device sessions on the account; propagating
+                # force_home_refresh=True here would rotate it out from under
+                # the OTHER device's live session, triggering a reciprocal 21204
+                # on the next keepalive. That creates a mutual ping-pong that
+                # neither device can escape (#47 follow-up).
+                # Let the home TTL (30 min) handle natural rotation; a device-
+                # only credential refresh is sufficient to recover from a
+                # transient 21204.
+                #
+                # Escalation (#47 dual-unit): if force_refresh keeps being
+                # called (N+ generations in <60s), the home secret was likely
+                # rotated by another device's e2e_login.  Device-only refreshes
+                # will keep returning a chat_secret the relay rejects (21204).
+                # After N consecutive urgent refreshes, escalate to home-level
+                # so this device can re-join the home.
+                #
+                # allow_home_refresh=False (secondary device, #47 Phase 4):
+                # the secondary must never rotate the shared home secret
+                # independently — it always uses the primary's published value.
+                _do_home_refresh = (
+                    force_refresh
+                    and entry is not None
+                    and entry.generation >= 3
+                    and (now - entry.created_at) < 60
+                    and allow_home_refresh
+                )
+                creds = self.e2e_login(
+                    home_id, device_id, model,
+                    force_home_refresh=_do_home_refresh,
+                )
                 generation = entry.generation + 1 if entry else 1
                 entry = E2ECredentialCacheEntry(
                     creds=creds,
@@ -966,8 +1179,9 @@ class EmaldoClient:
             high_marker: High battery marker percentage.
             low_marker: Low battery marker percentage.
             battery_range_override: When ``True`` activates the app's
-                "Battery Range = override" mode (byte 2 of payload). Default
-                ``False`` leaves the AI Battery Range setting unchanged.
+                "Battery Range = override" mode (byte 2 of payload = 0x01).
+                ``False`` writes byte 2 = 0x00, which disables Battery Range
+                Override and reverts to AI-chosen range.
             log: Optional log callback ``log(message: str)``.
 
         Returns:
@@ -1047,6 +1261,9 @@ class EmaldoClient:
     ) -> bool:
         """Send a sell (discharge-to-grid) command.
 
+        Uses the shared cached E2E credentials so the per-device ``chat_secret``
+        is not rotated out from under the active stream session (#47 follow-up).
+
         Args:
             duration_seconds: How long the sell window lasts.
             label: Verbose log label for the E2E command.
@@ -1055,7 +1272,7 @@ class EmaldoClient:
         Returns:
             *True* if acknowledged.
         """
-        creds = self.e2e_login(home_id, device_id, model)
+        creds = self.get_e2e_credentials(home_id, device_id, model)
         return _e2e.send_sell(creds, duration_seconds, label=label, log=log)
 
     def cancel_sell(
@@ -1067,8 +1284,12 @@ class EmaldoClient:
         label: str = "Cancel sell",
         log: Callable[..., None] | None = None,
     ) -> bool:
-        """Cancel an active sell command."""
-        creds = self.e2e_login(home_id, device_id, model)
+        """Cancel an active sell command.
+
+        Uses the shared cached E2E credentials so the per-device ``chat_secret``
+        is not rotated out from under the active stream session (#47 follow-up).
+        """
+        creds = self.get_e2e_credentials(home_id, device_id, model)
         return _e2e.cancel_sell(creds, label=label, log=log)
 
     # Emergency charge uses the same E2E type 0x01 command as sell.
@@ -1102,11 +1323,14 @@ class EmaldoClient:
     ) -> bool:
         """Start emergency charge for a specific time window.
 
+        Uses the shared cached E2E credentials so the per-device ``chat_secret``
+        is not rotated out from under the active stream session (#47 follow-up).
+
         Args:
             start_unix: Window start as a Unix timestamp.
             end_unix:   Window end as a Unix timestamp.
         """
-        creds = self.e2e_login(home_id, device_id, model)
+        creds = self.get_e2e_credentials(home_id, device_id, model)
         return _e2e.set_emergency_charge(
             creds, on=True,
             start_unix=start_unix, end_unix=end_unix,
@@ -1121,11 +1345,14 @@ class EmaldoClient:
         *,
         log: Callable[..., None] | None = None,
     ) -> bool:
-        """Disable emergency charge."""
-        return self.cancel_sell(
-            home_id, device_id, model,
-            label="Cancel emergency charge", log=log,
-        )
+        """Disable emergency charge.
+
+        Uses the shared cached E2E credentials and sends the cancel payload
+        (9 zero bytes) via ``set_emergency_charge(on=False)``, matching the
+        on-path used by :meth:`emergency_charge_window` (#47).
+        """
+        creds = self.get_e2e_credentials(home_id, device_id, model)
+        return _e2e.set_emergency_charge(creds, on=False, log=log)
 
     # ── Peak shaving ─────────────────────────────────────────────────
 

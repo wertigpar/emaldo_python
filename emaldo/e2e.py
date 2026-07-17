@@ -26,9 +26,43 @@ from .const import (
     SLOT_NO_OVERRIDE,
     get_app_id,
 )
-from .exceptions import EmaldoE2EError
+from .exceptions import EmaldoE2EError, EmaldoE2ESessionExpired
 
 _LOGGER = logging.getLogger(__name__)
+
+# Rate-limited diagnostic for DECRYPTED non-data push events in decrypt_response.
+# A "decrypted non-data push" is when AES decrypts cleanly but the payload is
+# NOT a power-flow/battery frame — the relay also sends status/control JSON
+# (e.g. ``{"__time":...,"domain":...}`` or ``cmd not allowed``) on the same
+# socket. These packets are *handled* (decrypted + identified) and ignored, not
+# *rejected* as errors. The search loop produces one such event per (nonce,
+# offset) candidate, so per-offset logging floods the log on every status push.
+# We coalesce into a single periodic line that preserves the signal (event count
+# + a classified sample payload) without the flood. The first event in a window
+# is logged immediately so a genuine single event is never swallowed; subsequent
+# events in the same window are counted and flushed at window expiry.
+_decrypt_rejected_lock = threading.Lock()
+_decrypt_rejected_count = 0
+_decrypt_rejected_window_start = 0.0
+_decrypt_rejected_sample: tuple[str, int, int, str] | None = None
+_DECRYPT_REJECTED_WINDOW_S = 60.0
+
+# Coalescing for the per-step decrypt diagnostics inside _try_parse_power_flow.
+# Every relay status/control push (non-power-flow) hits the device-key-failed
+# fallback and the final decrypt=None steps, which would otherwise emit a DEBUG
+# line per packet (~65/min). The first event in a window is logged immediately;
+# later events in the same window are counted and flushed once at expiry. Keep
+# the rare-but-useful parse-FAILED / decrypted-OK lines at full verbosity.
+_pf_rejected_lock = threading.Lock()
+_pf_rejected_count = 0
+_pf_rejected_window_start = 0.0
+_pf_rejected_window_s = 60.0
+
+# Cumulative count of power-flow packets dropped by _has_reasonable_power_flow_values.
+_power_flow_sanity_drops: int = 0
+
+def get_power_flow_sanity_drops() -> int:
+    return _power_flow_sanity_drops
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +92,24 @@ def encrypt_payload(plaintext: bytes, key: str, nonce: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Packet builders
 # ---------------------------------------------------------------------------
+
+def build_override_payload(
+    high_marker: int = DEFAULT_MARKER_HIGH,
+    low_marker: int = DEFAULT_MARKER_LOW,
+    battery_range_override: bool = False,
+    slot_values: bytes = b"",
+) -> bytes:
+    """Build raw (unencrypted) override payload for type 0x1A command.
+
+    Returns 4-byte header ``[high_marker, low_marker, enable_flag, n_slots]``
+    followed by *slot_values*.  Caller encrypts and wraps in a subscription
+    or override packet.
+    """
+    n_slots = len(slot_values)
+    assert n_slots in (96, 192)
+    enable_byte = 0x01 if battery_range_override else 0x00
+    return bytes([high_marker, low_marker, enable_byte, n_slots]) + slot_values
+
 
 def build_override_packet(
     e2e_creds: dict,
@@ -92,15 +144,14 @@ def build_override_packet(
     if msg_id is None:
         msg_id = generate_msg_id()
 
-    n_slots = len(slot_values)
-    assert n_slots in (96, 192)
     assert len(nonce) == 16
     assert len(msg_id) == 27
 
-    # Payload: 4-byte header + slot bytes
-    # Header: [high_marker, low_marker, enable_flag, slot_count]
-    enable_byte = 0x01 if battery_range_override else 0x00
-    override_payload = bytes([high_marker, low_marker, enable_byte, n_slots]) + slot_values
+    override_payload = build_override_payload(
+        high_marker=high_marker, low_marker=low_marker,
+        battery_range_override=battery_range_override,
+        slot_values=slot_values,
+    )
     encrypted = encrypt_payload(override_payload, e2e_creds["chat_secret"], nonce)
 
     pkt = bytes([0xD9, 0xA0, 0xA0])
@@ -315,12 +366,33 @@ def _is_override_payload(payload: bytes) -> bool:
     return payload[8] in (0x60, 0xC0)
 
 
+def _classify_decrypted_payload(payload_hex: str) -> str:
+    """Classify a decrypted-but-non-power-flow payload for diagnostics.
+
+    The relay delivers status/control JSON (e.g. ``{"__time":...,"domain":...}``
+    or ``cmd not allowed``) on the same socket as power-flow frames. These
+    decrypt cleanly but are not power-flow/battery data — they are *handled*
+    (decrypted + identified) and ignored, not *rejected* as errors. Returning a
+    human-readable label keeps the debug log honest about what happened.
+    """
+    try:
+        raw = bytes.fromhex(payload_hex)
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return "binary (not power-flow/battery)"
+    if all(32 <= b < 127 or b in (9, 10, 13) for b in text.encode("utf-8")):
+        preview = text if len(text) <= 48 else text[:45] + "..."
+        return f"text/status push: {preview!r}"
+    return "binary (not power-flow/battery)"
+
+
 def decrypt_response(
     data: bytes,
     key: str,
     *,
     accepted_headers: set[tuple[int, int]] | None = None,
     payload_validator: Callable[[bytes], bool] | None = None,
+    fallback_ivs: list[bytes] | None = None,
 ) -> bytes | None:
     """Decrypt the encrypted payload from an E2E response packet.
 
@@ -337,10 +409,15 @@ def decrypt_response(
         payload_validator: Optional callable that receives the decrypted
             payload and returns *True* if valid.  When provided, this
             replaces the *accepted_headers* check.
+        fallback_ivs: Optional list of additional IVs to try after marker-
+            extracted nonces (#47 beta15h).  Used when the relay response
+            format changed and no longer includes ``\\x10\\xa3`` markers.
 
     Returns:
         Decrypted payload bytes, or *None* on failure.
     """
+    global _decrypt_rejected_count, _decrypt_rejected_window_start, _decrypt_rejected_sample
+
     if payload_validator is None and accepted_headers is None:
         accepted_headers = _DEFAULT_HEADERS
 
@@ -360,9 +437,26 @@ def decrypt_response(
             idx = pos + 1
 
     if not nonces:
-        return None
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            _LOGGER.debug(
+                "decrypt_response: no nonce markers (90a3/10a3) found "
+                "in %d-byte response, hex=%s",
+                len(data), data[:128].hex(),
+            )
+        # Try fallback IVs even without markers (#47 beta15h)
+        if fallback_ivs:
+            nonces = list(fallback_ivs)
+        else:
+            return None
 
-    for nonce in nonces:
+    # Include caller-provided fallback IVs if response markers exist
+    all_ivs = list(nonces)
+    if fallback_ivs:
+        for fb in fallback_ivs:
+            if fb not in all_ivs:
+                all_ivs.append(fb)
+
+    for nonce in all_ivs:
         for offset in range(len(data) - 16, 39, -1):
             remaining = len(data) - offset
             if remaining % 16 != 0:
@@ -371,13 +465,88 @@ def decrypt_response(
                 cipher = AES.new(key_bytes, AES.MODE_CBC, iv=nonce)
                 decrypted = unpad(cipher.decrypt(data[offset:]), AES.block_size)
                 if payload_validator is not None:
-                    if payload_validator(decrypted):
-                        return decrypted
-                elif len(decrypted) >= 2 and (decrypted[0], decrypted[1]) in accepted_headers:
+                    valid = payload_validator(decrypted)
+                else:
+                    valid = len(decrypted) >= 2 and (decrypted[0], decrypted[1]) in accepted_headers
+                if valid:
+                    if _LOGGER.isEnabledFor(logging.DEBUG):
+                        _LOGGER.debug(
+                            "decrypt_response: SUCCESS nonce=%s offset=%d "
+                            "key_len=%d payload=%dB resp_full_hex=%s",
+                            nonce.hex(), offset, len(key),
+                            len(decrypted), data.hex(),
+                        )
                     return decrypted
+                # Decryption succeeded but the payload validator (or accepted
+                # headers) rejected it. This is the critical signal for the
+                # load-dependent #41 stall: the AES layer is fine (the key works
+                # — battery % keeps updating) yet the 0x30 power-flow payload
+                # format/values fall outside what the validator accepts under
+                # high load. We must NOT lose this signal, but per-offset logging
+                # floods the log on every non-power-flow packet (ACKs, status
+                # pushes). Coalesce into the rate-limited diagnostic below.
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    with _decrypt_rejected_lock:
+                        _decrypt_rejected_count += 1
+                        _decrypt_rejected_sample = (
+                            nonce.hex(), len(key),
+                            len(decrypted), decrypted.hex(),
+                        )
+                        now = time.monotonic()
+                        # First event ever: flush immediately so a single
+                        # genuine decrypt-non-data is never swallowed. After
+                        # that, count silently for the window then flush once.
+                        if _decrypt_rejected_window_start == 0.0:
+                            n = _decrypt_rejected_count
+                            sample = _decrypt_rejected_sample
+                            _decrypt_rejected_count = 0
+                            _decrypt_rejected_window_start = now
+                            _decrypt_rejected_sample = None
+                            _flush = True
+                        elif now - _decrypt_rejected_window_start \
+                                >= _DECRYPT_REJECTED_WINDOW_S:
+                            n = _decrypt_rejected_count
+                            sample = _decrypt_rejected_sample
+                            _decrypt_rejected_count = 0
+                            _decrypt_rejected_window_start = now
+                            _decrypt_rejected_sample = None
+                            _flush = True
+                        else:
+                            n = None
+                            sample = None
+                            _flush = False
+                    if _flush and sample is not None:
+                        _LOGGER.debug(
+                            "decrypt_response: DECRYPTED non-data push x%d "
+                            "(window=%.0fs, %s, sample nonce=%s key_len=%d "
+                            "payload_len=%d payload_hex=%s)",
+                            n, _DECRYPT_REJECTED_WINDOW_S,
+                            _classify_decrypted_payload(sample[3]),
+                            sample[0], sample[1], sample[2], sample[3],
+                        )
             except (ValueError, KeyError):
                 continue
 
+    if _LOGGER.isEnabledFor(logging.DEBUG) and nonces:
+        def _positions(marker: bytes) -> list[int]:
+            out = []
+            idx = 0
+            while idx < len(data) - 1:
+                pos = data.find(marker, idx)
+                if pos < 0:
+                    break
+                out.append(pos)
+                idx = pos + 1
+            return out
+        _LOGGER.debug(
+            "decrypt_response: %d nonce(s) tried but decryption/validation "
+            "failed for all offsets (key_len=%d, resp %dB, "
+            "90a3_pos=%s 10a3_pos=%s, nonces=%s resp_full_hex=%s)",
+            len(all_ivs), len(key), len(data),
+            _positions(b"\x90\xa3"), _positions(b"\x10\xa3"),
+            [n.hex() for n in all_ivs],
+            data.hex(),
+        )
     return None
 
 
@@ -409,6 +578,13 @@ def parse_override_state(payload: bytes) -> dict | None:
     if n_slots not in (0x60, 0xC0):
         return None
     if len(payload) < 9 + n_slots:
+        return None
+    # Markers are battery percentages (0-100). A corrupt/garbage byte here
+    # (seen historically during 21204 reconnect recovery) would otherwise be
+    # exposed as a >100 number entity and break apply_bulk_schedule, which
+    # validates 0-100 (#45). Treat an out-of-range marker as a corrupt frame
+    # and reject the whole read so the coordinator keeps the last good values.
+    if payload[0] > 100 or payload[1] > 100:
         return None
     return {
         "high_marker": payload[0],
@@ -569,24 +745,40 @@ def _has_reasonable_power_flow_values(payload: bytes) -> bool:
     to stay far below 200 kW per channel, so values beyond that are treated as
     corrupt or misclassified payloads rather than published as multi-megawatt
     sensor spikes.
+
+    Non-entity auxiliary fields (ip2_w, op2_w) are not validated — they carry
+    raw watts and are not mapped to HA sensors (#41).
     """
+    global _power_flow_sanity_drops
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
     signed_offsets = (0, 2, 4, 6, 8, 10)
     for offset in signed_offsets:
-        if abs(struct.unpack_from("<h", payload, offset)[0]) > _POWER_FLOW_MAX_RAW_HECTOWATTS:
-            return False
-
-    unsigned_offsets = (12, 14)
-    for offset in unsigned_offsets:
-        if struct.unpack_from("<H", payload, offset)[0] > _POWER_FLOW_MAX_RAW_HECTOWATTS:
+        val = struct.unpack_from("<h", payload, offset)[0]
+        if abs(val) > _POWER_FLOW_MAX_RAW_HECTOWATTS:
+            _log.debug(
+                "PowerFlow reasonability fail: signed offset=%d value=%d "
+                "exceeds max=%d raw_hectowatts",
+                offset, val, _POWER_FLOW_MAX_RAW_HECTOWATTS,
+            )
+            _power_flow_sanity_drops += 1
             return False
 
     if len(payload) >= 18:
         if payload[16] not in (0, 1) or payload[17] not in (0, 1):
+            _power_flow_sanity_drops += 1
             return False
     if len(payload) >= 20 and payload[19] not in (0, 1):
         return False
     if len(payload) >= 22:
-        if abs(struct.unpack_from("<h", payload, 20)[0]) > _POWER_FLOW_MAX_RAW_HECTOWATTS:
+        val = struct.unpack_from("<h", payload, 20)[0]
+        if abs(val) > _POWER_FLOW_MAX_RAW_HECTOWATTS:
+            _log.debug(
+                "PowerFlow reasonability fail: dual_power offset=%d value=%d "
+                "exceeds max=%d raw_hectowatts",
+                20, val, _POWER_FLOW_MAX_RAW_HECTOWATTS,
+            )
+            _power_flow_sanity_drops += 1
             return False
 
     return True
@@ -626,8 +818,8 @@ def parse_power_flow(payload: bytes) -> dict | None:
     6-7     2     addition_load_w         signed short – additional load
     8-9     2     other_load_w            signed short – other load
     10-11   2     ev_w                    signed short – EV charger
-    12-13   2     ip2_w                   unsigned short – input port 2
-    14-15   2     op2_w                   unsigned short – output port 2
+    12-13   2     ip2_w                   unsigned short – input port 2 (raw W)
+    14-15   2     op2_w                   unsigned short – output port 2 (raw W)
     16      1     grid_valid              bool – grid CT sensor present
     17      1     bsensor_valid           bool – battery sensor present
     18      1     solar_efficiency        enum – solar efficiency type
@@ -652,8 +844,8 @@ def parse_power_flow(payload: bytes) -> dict | None:
     addition_load_w = struct.unpack_from("<h", payload, 6)[0] * _scale
     other_load_w = struct.unpack_from("<h", payload, 8)[0] * _scale
     ev_w = struct.unpack_from("<h", payload, 10)[0] * _scale
-    ip2_w = struct.unpack_from("<H", payload, 12)[0] * _scale
-    op2_w = struct.unpack_from("<H", payload, 14)[0] * _scale
+    ip2_w = struct.unpack_from("<H", payload, 12)[0]  # raw watts, not hectowatts
+    op2_w = struct.unpack_from("<H", payload, 14)[0]  # raw watts, not hectowatts
 
     # Extended fields (bytes 16-21) may be absent in older firmware
     length = len(payload)
@@ -858,6 +1050,7 @@ def read_battery_info(
     timeout: float = 5.0,
     probe_timeout: float = 1.5,
     slots: list[int] | None = None,
+    known_serial_slots: dict[str, int] | None = None,
     log: Callable[..., None] | None = None,
 ) -> list[dict]:
     """Read battery cell info via E2E request (type 0x06).
@@ -881,6 +1074,12 @@ def read_battery_info(
         slots: When given, probe exactly these cabinet slot indices (a fast
             re-scan of previously discovered slots). When ``None`` (default),
             run a full cabinet discovery across all known tiers.
+        known_serial_slots: Optional serial -> slot-index map from previous
+            scans. A probe reply whose serial is already known to belong to a
+            *different* slot is a stray late datagram that leaked into this
+            slot's receive window (e.g. the rightful slot timed out this round),
+            so it is rejected rather than misassigned. Independent of the
+            device's own index fields, so it is safe across cabinets (#44).
         log: Optional log callback.
 
     Returns:
@@ -936,6 +1135,21 @@ def read_battery_info(
         did not reply at all, or ``"empty"`` for a present-but-non-battery
         reply (short ACK or unparseable payload).
         """
+        # Drain any stale UDP datagrams (late replies from previous probes)
+        # before sending this probe.  Without draining, a slow-responding
+        # module at slot N-1 can deliver its reply during slot N's receive
+        # window, causing slot N's _probe_slot to return slot N-1's data and
+        # assign it scan_index=N — producing the cascading +1 shift reported
+        # in issue #44.
+        _cur_timeout = sock.gettimeout()
+        sock.settimeout(0)
+        while True:
+            try:
+                sock.recvfrom(4096)
+            except OSError:
+                break
+        sock.settimeout(_cur_timeout)
+
         req = build_subscription_packet(
             e2e_creds, 0x06, session_nonce,
             payload=bytes([idx]),
@@ -971,7 +1185,7 @@ def read_battery_info(
 
         if info and info["serial"] not in seen_serials:
             seen_serials.add(info["serial"])
-            info["scan_index"] = idx
+            info["scan_index"] = info.get("index", idx)
             return info
         return "empty"
 
@@ -1298,33 +1512,88 @@ def read_power_flow(
         time.sleep(0.2)
 
         resp = _send(power_pkt, "PowerFlow(0x30)")
+        if resp and log:
+            log(f"  raw ({len(resp)}B): {resp[:128].hex()}")
+            has_90a3 = b"\x90\xa3" in resp
+            has_10a3 = b"\x10\xa3" in resp
+            log(f"  nonce markers: 90a3={has_90a3} 10a3={has_10a3}")
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "read_power_flow: full resp (%dB) hex=%s",
+                    len(resp), resp.hex(),
+                )
         if not resp:
             return None
 
         decrypted = decrypt_response(
             resp, e2e_creds["chat_secret"],
             payload_validator=_is_power_flow_payload,
+            fallback_ivs=[session_nonce.encode()],
         )
+        if decrypted is None:
+            # Fallback: home-level chat_secret (#47 beta15h)
+            home_secret = e2e_creds.get("home_chat_secret", "")
+            if home_secret and home_secret != e2e_creds.get("chat_secret", ""):
+                if log:
+                    log("  decrypt with chat_secret failed, trying home_chat_secret")
+                decrypted = decrypt_response(
+                    resp, home_secret,
+                    payload_validator=_is_power_flow_payload,
+                    fallback_ivs=[session_nonce.encode()],
+                )
         if decrypted is not None and log:
             _log_power_flow_raw(decrypted, log)
+        elif decrypted is None and log:
+            log(f"  decrypt_response returned None (resp {len(resp)}B)")
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "read_power_flow: decrypt None resp (%dB) hex=%s",
+                    len(resp), resp.hex(),
+                )
         result = parse_power_flow(decrypted)
         if result is not None:
             return result
+        if decrypted is not None and log:
+            log(f"  parse_power_flow FAILED on decrypted payload ({len(decrypted)}B)")
 
         # First response may be an echo/ACK; try a few more
+        drain_idx = 0
         for _ in range(5):
             try:
                 resp, _ = sock.recvfrom(4096)
+                drain_idx += 1
+                if log:
+                    log(f"  legacy drain #{drain_idx} ({len(resp)}B): {resp[:128].hex()}")
                 decrypted = decrypt_response(
                     resp, e2e_creds["chat_secret"],
                     payload_validator=_is_power_flow_payload,
+                    fallback_ivs=[session_nonce.encode()],
                 )
+                if decrypted is None:
+                    home_secret = e2e_creds.get("home_chat_secret", "")
+                    if home_secret and home_secret != e2e_creds.get("chat_secret", ""):
+                        decrypted = decrypt_response(
+                            resp, home_secret,
+                            payload_validator=_is_power_flow_payload,
+                            fallback_ivs=[session_nonce.encode()],
+                        )
                 if decrypted is not None and log:
                     _log_power_flow_raw(decrypted, log)
+                elif decrypted is None and log:
+                    log(f"  legacy drain #{drain_idx}: decrypt=None")
+                    if _LOGGER.isEnabledFor(logging.DEBUG):
+                        _LOGGER.debug(
+                            "read_power_flow: legacy drain #%d resp (%dB) hex=%s",
+                            drain_idx, len(resp), resp.hex(),
+                        )
                 result = parse_power_flow(decrypted)
                 if result is not None:
                     return result
+                if decrypted is not None and log:
+                    log(f"  legacy drain #{drain_idx}: parse FAILED")
             except socket.timeout:
+                if log:
+                    log(f"  legacy drain #{drain_idx}: timeout (no more packets)")
                 break
 
         return None
@@ -1515,29 +1784,54 @@ def cancel_sell(
     sock.settimeout(timeout)
     addr = (host, port)
 
+    def _is_emergency() -> bool:
+        return "emergency" in label.lower() or "charge" in label.lower()
+
     def _send(pkt: bytes, label: str) -> bytes | None:
+        t0 = time.monotonic()
         sock.sendto(pkt, addr)
         try:
             resp, _ = sock.recvfrom(4096)
+            elapsed = (time.monotonic() - t0) * 1000
+            if _is_emergency():
+                _LOGGER.debug(
+                    "[EmergencyCharge] %s: sent %dB \u2192 got %dB (rtt=%.1fms) resp_hex=%s",
+                    label, len(pkt), len(resp), elapsed, resp[:64].hex(),
+                )
             if log:
                 log(f"{label}: sent {len(pkt)}B \u2192 got {len(resp)}B")
             return resp
         except socket.timeout:
+            elapsed = (time.monotonic() - t0) * 1000
+            if _is_emergency():
+                _LOGGER.debug(
+                    "[EmergencyCharge] %s: sent %dB \u2192 timeout (%.1fms)",
+                    label, len(pkt), elapsed,
+                )
             if log:
                 log(f"{label}: sent {len(pkt)}B \u2192 no response")
             return None
 
     try:
-        _send(home_alive, "Alive(home)")
-        _send(dev_alive, "Alive(device)")
-        _send(wake, "Wake")
-        _send(heartbeat, "Heartbeat")
+        if _send(home_alive, "Alive(home)") is None: return False
+        if _send(dev_alive, "Alive(device)") is None: return False
+        if _send(wake, "Wake") is None: return False
+        if _send(heartbeat, "Heartbeat") is None: return False
         time.sleep(0.2)
 
         resp = _send(cancel_pkt, label)
-        if resp and len(resp) == 161:
-            return True
-        return resp is not None
+        if _is_emergency():
+            _LOGGER.debug(
+                "[EmergencyCharge] cancel result=%s resp_len=%s",
+                resp is not None, len(resp) if resp else None,
+            )
+        if resp is None:
+            return False
+        if b"CONN_NOT_ESTABLISHED" in resp:
+            if _is_emergency():
+                _LOGGER.debug("[EmergencyCharge] cancel rejected: CONN_NOT_ESTABLISHED")
+            return False
+        return True
     finally:
         sock.close()
 
@@ -1577,8 +1871,15 @@ def set_emergency_charge(
             now = time.time()
             end_unix = int(now - (int(now) % 3600)) + 172800
         payload = struct.pack("<BII", 1, start_unix, end_unix)
+        _LOGGER.debug(
+            "[EmergencyCharge] enabling: start=%d end=%d payload_hex=%s",
+            start_unix, end_unix, payload.hex(),
+        )
     else:
         payload = bytes(9)  # 9 zeros
+        _LOGGER.debug(
+            "[EmergencyCharge] disabling: payload_hex=%s", payload.hex(),
+        )
 
     session_nonce = generate_nonce()
     home_alive = build_alive_packet(
@@ -1603,25 +1904,45 @@ def set_emergency_charge(
     addr = (host, port)
 
     def _send(pkt: bytes, label: str) -> bytes | None:
+        t0 = time.monotonic()
         sock.sendto(pkt, addr)
         try:
             resp, _ = sock.recvfrom(4096)
+            elapsed = (time.monotonic() - t0) * 1000
+            _LOGGER.debug(
+                "[EmergencyCharge] %s: sent %dB \u2192 got %dB (rtt=%.1fms) resp_hex=%s",
+                label, len(pkt), len(resp), elapsed, resp[:64].hex(),
+            )
             if log:
                 log(f"{label}: sent {len(pkt)}B \u2192 got {len(resp)}B")
             return resp
         except socket.timeout:
+            elapsed = (time.monotonic() - t0) * 1000
+            _LOGGER.debug(
+                "[EmergencyCharge] %s: sent %dB \u2192 timeout (%.1fms)",
+                label, len(pkt), elapsed,
+            )
             if log:
                 log(f"{label}: sent {len(pkt)}B \u2192 no response")
             return None
 
     try:
-        _send(home_alive, "Alive(home)")
-        _send(dev_alive, "Alive(device)")
-        _send(wake, "Wake")
-        _send(heartbeat, "Heartbeat")
+        if _send(home_alive, "Alive(home)") is None: return False
+        if _send(dev_alive, "Alive(device)") is None: return False
+        if _send(wake, "Wake") is None: return False
+        if _send(heartbeat, "Heartbeat") is None: return False
         time.sleep(0.2)
         resp = _send(cmd_pkt, "EmergencyCharge")
-        return resp is not None
+        if resp is None:
+            _LOGGER.debug("[EmergencyCharge] result=False (no response)")
+            return False
+        if b"CONN_NOT_ESTABLISHED" in resp:
+            _LOGGER.debug("[EmergencyCharge] command rejected: CONN_NOT_ESTABLISHED")
+            return False
+        _LOGGER.debug(
+            "[EmergencyCharge] result=True resp_len=%s", len(resp),
+        )
+        return True
     finally:
         sock.close()
 
@@ -2826,7 +3147,7 @@ class PersistentE2ESession:
         client.login(email, password)
         creds = client.e2e_login(home_id, device_id, model)
 
-        session = PersistentE2ESession(creds)
+        session = PersistentE2ESession(creds, home_id=home_id)
         session.connect()
         try:
             data = session.read_power_flow()  # fast — reuses socket
@@ -2838,7 +3159,7 @@ class PersistentE2ESession:
 
         import threading
 
-        session = PersistentE2ESession(creds)
+        session = PersistentE2ESession(creds, home_id=home_id)
         session.connect()
 
         def _keepalive_loop():
@@ -2869,16 +3190,66 @@ class PersistentE2ESession:
     POWER_FLOW_DRAIN_PACKETS = 5
     POWER_FLOW_DRAIN_TIMEOUT_SECONDS = 0.5
 
+    # -- Cross-device key registry (home_id → {device_id → chat_secret}) ------
+    # Populated by each coordinator during _ensure_session(). Used by the
+    # stream drain loop to try every known device secret on each received
+    # datagram, so packets from ALL devices on the same account are decrypted
+    # instead of landing as unparsed (#47 beta15f).
+    _device_key_registry: dict[str, dict[str, str]] = {}
+
+    @classmethod
+    def register_device_key(cls, home_id: str, device_id: str, chat_secret: str) -> None:
+        """Register a device's chat_secret for cross-device decryption."""
+        cls._device_key_registry.setdefault(home_id, {})[device_id] = chat_secret
+
+    @classmethod
+    def unregister_device_key(cls, home_id: str, device_id: str) -> None:
+        """Remove a device's chat_secret from the registry."""
+        cls._device_key_registry.get(home_id, {}).pop(device_id, None)
+
+    def rekey_home(self, home_data: dict) -> None:
+        """Update home-level credentials after a shared secret rotation (#47).
+
+        Called by the home secret callback when another device on the same
+        account has rotated the home ``end_secret`` (``/home/e2e-login/``).
+
+        Updates the in-memory ``home_end_id``, ``home_group_id``,
+        ``home_end_secret``, and ``home_chat_secret`` in ``self._creds``.
+        The next keepalive will pick up the new values automatically — no
+        UDP re-handshake needed since the relay-side ledger is already
+        updated by the ``/home/e2e-login/`` call that triggered this re-key.
+        """
+        old_id = self._creds.get("home_end_id", "?")
+        new_id = home_data.get("end_id", "")
+        with self._lock:
+            self._creds["home_end_id"] = new_id
+            self._creds["home_group_id"] = home_data.get("group_id", "")
+            self._creds["home_end_secret"] = home_data.get("end_secret", "")
+            self._creds["home_chat_secret"] = home_data.get("chat_secret", "")
+        if self._log:
+            self._log(
+                f"Rekeyed home credentials for home_id={self._home_id}: "
+                f"end_id {old_id} -> {new_id}"
+            )
+
     def __init__(
         self,
         e2e_creds: dict,
         *,
+        home_id: str,
         timeout: float = 5.0,
         log: Callable[..., None] | None = None,
+        creds_provider: Callable[..., dict] | None = None,
     ) -> None:
+        self._home_id = home_id
         self._creds = e2e_creds
         self._timeout = timeout
         self._log = log
+        # Optional callback returning fresh E2E credentials (latest, shared
+        # chat_secret). Called on reconnect so the stream picks up a rotated
+        # secret instead of re-handshaking with a stale one (which would 21204
+        # forever). Signature: creds_provider(*, force_refresh: bool) -> dict.
+        self._creds_provider = creds_provider
         self._sock: socket.socket | None = None
         self._addr: tuple[str, int] | None = None
         self._session_nonce: str | None = None
@@ -2887,6 +3258,12 @@ class PersistentE2ESession:
         self._last_rtt_ms: float | None = None
         self._last_keepalive_failure_reason: str | None = None
         self._last_handshake_monotonic: float | None = None
+        # Outcome of the most recent handshake: "ok" (relay replied), "no_response"
+        # (silent socket rebuild — a "reconnect" that re-established nothing), or
+        # "session_expired_21204". The handshake is otherwise fire-and-forget, so
+        # reconnect counters alone say nothing about whether a session actually
+        # came back; this exposes that for diagnostics.
+        self._last_handshake_response: str | None = None
         self._last_keepalive_monotonic: float | None = None
         self._last_21204_monotonic: float | None = None
         self._last_21204_stage: str | None = None
@@ -2903,6 +3280,70 @@ class PersistentE2ESession:
             "drain_exhausted": 0,
         }
         self._lock = threading.Lock()
+        # -- Subscribe-and-stream receiver state (beta13d) -------------------
+        self._stream_thread: threading.Thread | None = None
+        self._stream_stop = threading.Event()
+        # Per-device cache: device_id → power_flow_data / monotonic_timestamp.
+        # Enables cross-device decryption (#47 beta15f): each coordinator reads
+        # only its own device's cached frame.
+        self._latest_power_flow: dict[str, dict] = {}
+        self._latest_power_flow_monotonic: dict[str, float] = {}
+        self._last_subscribe_monotonic: float | None = None
+        self._stream_needs_reconnect = False
+        self._stream_needs_creds_refresh = False
+        self._stream_resubscribe_interval = 12.0
+        self._stream_keepalive_interval = 7.0
+        self._stream_drain_timeout = 0.4
+        self._stream_poll_sleep = 0.1
+        # Adaptive resubscribe: recover a single dropped subscribe-response fast
+        # without sustaining a tight cadence (which triggers relay 21204s).
+        self._stream_frame_gap_resubscribe = 7.0
+        self._stream_min_resubscribe_gap = 5.0
+        self._stream_stale_after = 20.0
+        # Long-stall watchdog: rebuild the session in place if frames stop for
+        # this long (the only stream teardown path — the coordinator no longer
+        # reconnects on staleness in stream mode).
+        self._stream_long_stall = 45.0
+        self._stream_started_monotonic: float | None = None
+        self._stream_frames_received = 0
+        self._stream_resubscribes = 0
+        self._stream_reconnects = 0
+        # Diagnostics: what triggered each stream reconnect (so a storm can be
+        # diagnosed from the sensor attributes without debug logging).
+        self._stream_reconnect_reasons: dict[str, int] = {}
+        self._stream_last_reconnect_reason: str | None = None
+        self._stream_drain_packets = 0
+        self._stream_drain_unparsed = 0
+        # Decrypt-gated reconnect success (#53 Q1/Q3). A handshake returning
+        # "ok" only proves the transport reconnected — it does NOT prove the
+        # current chat_secret can still decrypt the realtime push stream. We
+        # therefore track the wall-clock (monotonic) time of the last
+        # successfully DECRYPTED power-flow frame. _stream_reconnect_locked
+        # requires a fresh decrypted frame (not just handshake ok) before it
+        # declares the session recovered; otherwise it escalates to a forced
+        # credential/home-secret refresh. _stream_ever_decrypted gates the
+        # escalation so a never-yet-healthy session (cold start, inverter
+        # offline) is not punished as a stale-secret failure.
+        self._stream_last_decrypted_frame_ts: float = 0.0
+        self._stream_ever_decrypted = False
+        # Deadline by which a decrypted frame must arrive after a handshake-ok
+        # reconnect, else the reconnect is treated as decrypt-failed. Armed in
+        # _stream_reconnect_locked; None when no gate is pending.
+        self._stream_decrypt_gate_deadline: float | None = None
+        # Grace window (seconds) for the decrypt gate. Sized like the startup
+        # first-frame wait: a healthy stream delivers a frame within a couple of
+        # subscribe cycles.
+        self._stream_decrypt_gate_window = 30.0
+        # Escalating reconnect backoff. The streak resets when a frame arrives
+        # OR when a handshake succeeds (beta13e), so a single competing read
+        # cannot ratchet the backoff up to the 30 s ceiling.
+        self._stream_reconnect_streak = 0
+        self._stream_reconnect_backoff_anchor_frames = 0
+        self._stream_reconnect_backoff_max = 30.0
+        # Monotonic deadline for the next reconnect attempt. The wait is served
+        # by the loop's poll-sleep (lock released between iterations) instead of
+        # time.sleep() under the lock, so reads never stall behind the backoff.
+        self._stream_reconnect_not_before: float | None = None
 
     @property
     def closed(self) -> bool:
@@ -2928,6 +3369,11 @@ class PersistentE2ESession:
     def last_keepalive_failure_reason(self) -> str | None:
         """Last keepalive failure reason for diagnostics."""
         return self._last_keepalive_failure_reason
+
+    @property
+    def last_handshake_response(self) -> str | None:
+        """Outcome of the most recent handshake (ok/no_response/21204)."""
+        return self._last_handshake_response
 
     @property
     def last_power_flow_diag(self) -> dict[str, int | bool]:
@@ -2963,15 +3409,28 @@ class PersistentE2ESession:
         heartbeat = build_heartbeat_packet(self._creds, self._session_nonce)
         wake = build_wake_packet(self._creds, self._session_nonce)
 
-        self._send_raw(home_alive, "Alive(home)")
-        self._send_raw(dev_alive, "Alive(device)")
+        r_home = self._send_raw(home_alive, "Alive(home)")
+        r_dev = self._send_raw(dev_alive, "Alive(device)")
         self._send_raw(wake, "Wake")
-        self._send_raw(heartbeat, "Heartbeat")
+        r_hb = self._send_raw(heartbeat, "Heartbeat")
         time.sleep(0.2)
+        # Record whether the relay actually answered the handshake so reconnect
+        # diagnostics can distinguish a genuinely re-established session from a
+        # silent socket rebuild (the handshake is fire-and-forget otherwise).
+        responses = [r for r in (r_home, r_dev, r_hb) if r is not None]
+        if any(self._is_session_expired(r) for r in responses):
+            self._last_handshake_response = "session_expired_21204"
+        elif responses:
+            self._last_handshake_response = "ok"
+        else:
+            self._last_handshake_response = "no_response"
         self._last_handshake_monotonic = time.perf_counter()
         if self._log:
             elapsed_ms = (self._last_handshake_monotonic - started) * 1000.0
-            self._log(f"Handshake complete in {elapsed_ms:.1f}ms")
+            self._log(
+                f"Handshake complete in {elapsed_ms:.1f}ms "
+                f"(response={self._last_handshake_response})"
+            )
 
     def keepalive(self) -> bool:
         """Send a fresh alive+heartbeat to keep the session alive.
@@ -3023,6 +3482,18 @@ class PersistentE2ESession:
                         self._log("Keepalive saw 21204 — session expired")
                     self._last_keepalive_failure_reason = "session_expired_21204"
                     return False
+                if resp is None:
+                    # A healthy relay echoes the alive packet. No reply means
+                    # the relay is not answering; treating this as success (the
+                    # previous behaviour) masked relay unresponsiveness and fed
+                    # false positives into the coordinator's healthy-keepalive
+                    # reconnect-deferral. Report it as a distinct failure so a
+                    # single stray timeout is tolerated (loop needs 2 in a row)
+                    # but a silent relay no longer looks healthy.
+                    if self._log:
+                        self._log("Keepalive got no response — relay silent")
+                    self._last_keepalive_failure_reason = "response_timeout"
+                    return False
                 return True
             except Exception as err:  # noqa: BLE001 - best-effort keepalive
                 if self._log:
@@ -3045,13 +3516,48 @@ class PersistentE2ESession:
 
             return self._read_power_flow_locked(reconnect_on_expiry=True)
 
-    def _read_power_flow_locked(self, *, reconnect_on_expiry: bool) -> dict | None:
+    def read_power_flow_for_creds(self, target_creds: dict) -> dict | None:
+        """Read power flow using *target_creds* (secondary device).
+
+        Uses the established session socket but sends the 0x30 subscription
+        with *target_creds* (different ``sender_end_id`` / ``chat_secret``)
+        instead of the session's own credentials.  Does NOT send
+        ``Alive(home)`` — the session must already be alive via the primary
+        device.
+
+        On 21204 (session expired) returns *None* without reconnecting; the
+        primary device handles re-handshake.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+            return self._read_power_flow_locked(
+                reconnect_on_expiry=False, creds=target_creds
+            )
+
+    def _read_power_flow_locked(
+        self, *, reconnect_on_expiry: bool, creds: dict | None = None
+    ) -> dict | None:
         """Power-flow read body.  Caller must hold ``self._lock``.
 
         When *reconnect_on_expiry* is *True* (first attempt), a 21204 response
         triggers an in-place re-handshake. We then return *None* and let the
         coordinator's next poll read using the refreshed session.
+
+        *creds* — when provided (secondary device), use these credentials for
+        the 0x30 subscription instead of ``self._creds`` and skip reconnect
+        on 21204 (only the primary device re-handshakes).
         """
+        actual_creds = creds if creds is not None else self._creds
+        # Cross-device read over a shared session: present as session owner
+        # on the wire (relay binds socket to handshake device), keep target
+        # recipient for routing (#47).
+        if creds is not None and self._creds is not None and creds.get("sender_end_id") != self._creds.get("sender_end_id"):
+            actual_creds = dict(creds)
+            actual_creds["sender_end_id"] = self._creds["sender_end_id"]
+            actual_creds["sender_group_id"] = self._creds["sender_group_id"]
+            actual_creds["chat_secret"] = self._creds["chat_secret"]
+        is_own_creds = creds is None
         self._last_power_flow_diag = {
             "initial_timeout": 0,
             "initial_session_expired": 0,
@@ -3063,14 +3569,45 @@ class PersistentE2ESession:
             "drain_timeout": 0,
             "drain_socket_error": 0,
             "drain_exhausted": 0,
+            "predrain_packets": 0,
         }
+
+        # Drain stale push frames or leftover alive responses from the socket
+        # buffer before sending the 0x30 subscription.  The persistent session
+        # keeps the 0x30 subscription alive between polls, so pushed frames
+        # accumulate and pollute the initial recvfrom (#41).
+        _predrain_timeout = self._sock.gettimeout()
+        self._sock.settimeout(0.05)
+        try:
+            while True:
+                try:
+                    _stale, _ = self._sock.recvfrom(4096)
+                    self._last_power_flow_diag["predrain_packets"] += 1
+                except socket.timeout:
+                    break
+        except OSError:
+            pass
+        finally:
+            try:
+                self._sock.settimeout(_predrain_timeout)
+            except OSError:
+                pass
+
         power_pkt = build_subscription_packet(
-            self._creds, 0x30, self._session_nonce, payload=bytes([0x01]),
+            actual_creds, 0x30, self._session_nonce, payload=bytes([0x01]),
         )
         resp = self._send_raw(power_pkt, "PowerFlow(0x30)")
         if resp is None:
             self._last_power_flow_diag["initial_timeout"] = 1
             return None
+
+        if self._log:
+            self._log(
+                f"PowerFlow(0x30) raw ({len(resp)}B): {resp[:128].hex()}"
+            )
+            has_90a3 = b"\x90\xa3" in resp
+            has_10a3 = b"\x10\xa3" in resp
+            self._log(f"  nonce markers: 90a3={has_90a3} 10a3={has_10a3}")
 
         # Session expired — reconnect in place and retry once.
         if self._is_session_expired(resp):
@@ -3086,18 +3623,31 @@ class PersistentE2ESession:
                     f"(age_since_handshake={handshake_age_ms}, "
                     f"age_since_keepalive={keepalive_age_ms})"
                 )
-            if reconnect_on_expiry and self._reconnect_after_expiry():
+            if is_own_creds and reconnect_on_expiry and self._reconnect_after_expiry():
+                # Retry the read immediately on the refreshed session instead
+                # of deferring to the next poll. Deferring turned every 21204
+                # into a guaranteed empty read (~2.4s wasted per poll) and, when
+                # the relay expires the session on each first read, produced an
+                # endless empty-read chain (#41). The retry passes
+                # reconnect_on_expiry=False, so a second 21204 returns None and
+                # cannot loop.
                 if self._log:
                     self._log(
-                        "Session re-handshaked after 21204; deferring power-flow "
-                        "read until next poll"
+                        "Session re-handshaked after 21204; retrying power-flow "
+                        "read on the refreshed session"
                     )
+                return self._read_power_flow_locked(reconnect_on_expiry=False)
             return None
 
-        result = self._try_parse_power_flow(resp)
+        result = self._try_parse_power_flow(resp, actual_creds["chat_secret"])
         if result is not None:
             return result
         self._last_power_flow_diag["initial_nonmatching"] = 1
+        if self._log:
+            self._log(
+                f"  initial parse FAILED ({len(resp)}B); "
+                f"draining up to {self.POWER_FLOW_DRAIN_PACKETS} packet(s)"
+            )
 
         # First response may be a subscription ACK or another interleaved push;
         # drain a few more packets with a short timeout before declaring the
@@ -3128,16 +3678,26 @@ class PersistentE2ESession:
                     if self._log:
                         self._log("Session expired mid-drain")
                     break
-                result = self._try_parse_power_flow(more_resp)
+                result = self._try_parse_power_flow(more_resp, actual_creds["chat_secret"])
                 if result is not None:
                     self._last_power_flow_diag["drain_powerflow_hits"] += 1
+                    if self._log:
+                        self._log(
+                            f"  drain packet #{self._last_power_flow_diag['drain_packets_seen']}: "
+                            f"parse OK"
+                        )
                     return result
-                rf = self._try_parse_regulate_frequency(more_resp)
+                if self._log:
+                    self._log(
+                        f"  drain packet #{self._last_power_flow_diag['drain_packets_seen']} "
+                        f"({len(more_resp)}B): {more_resp[:128].hex()}"
+                    )
+                rf = self._try_parse_regulate_frequency(more_resp, actual_creds["chat_secret"])
                 if rf is not None:
                     self._last_power_flow_diag["drain_regfreq_hits"] += 1
                     self._regulate_frequency_cache = rf
                     if self._log:
-                        self._log(f"Passive 0x45 push captured: {rf}")
+                        self._log(f"  drain: passive 0x45 push captured: {rf}")
         finally:
             try:
                 self._sock.settimeout(prev_timeout)
@@ -3147,6 +3707,573 @@ class PersistentE2ESession:
         self._last_power_flow_diag["drain_exhausted"] = 1
 
         return None
+
+    # -- Subscribe-and-stream receiver (beta13d) ---------------------------- #
+
+    def start_stream(
+        self,
+        *,
+        resubscribe_interval: float = 12.0,
+        keepalive_interval: float = 7.0,
+        drain_timeout: float = 0.4,
+        poll_sleep: float = 0.1,
+        frame_gap_resubscribe: float = 7.0,
+        min_resubscribe_gap: float = 5.0,
+        stale_after: float = 20.0,
+        long_stall: float = 45.0,
+    ) -> None:
+        """Start the background power-flow stream receiver.
+
+        Subscribes once to the 0x30 power-flow stream and keeps a dedicated
+        thread draining the pushed frames, re-subscribing every
+        *resubscribe_interval* seconds and sending keepalives every
+        *keepalive_interval* seconds (matching the official app's cadence).
+
+        To recover quickly from an occasional dropped subscribe-response
+        without sustaining a tight cadence (which makes the relay return
+        21204), an *adaptive* resubscribe fires when no frame has arrived for
+        *frame_gap_resubscribe* seconds — but never closer together than
+        *min_resubscribe_gap* seconds, and only while the cached frame is still
+        within *stale_after* (beyond that the coordinator's reconnect path
+        takes over instead of hammering subscribes).
+
+        The freshest decoded frame is available via
+        :meth:`get_latest_power_flow`. This single thread owns all socket reads;
+        other request/response helpers continue to work because they hold the
+        same lock, serialising access.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+            if self._stream_thread is not None and self._stream_thread.is_alive():
+                return
+            self._stream_resubscribe_interval = resubscribe_interval
+            self._stream_keepalive_interval = keepalive_interval
+            self._stream_drain_timeout = drain_timeout
+            self._stream_poll_sleep = poll_sleep
+            self._stream_frame_gap_resubscribe = frame_gap_resubscribe
+            self._stream_min_resubscribe_gap = min_resubscribe_gap
+            self._stream_stale_after = stale_after
+            self._stream_long_stall = long_stall
+            self._stream_stop.clear()
+            self._last_subscribe_monotonic = None  # subscribe immediately
+            self._last_keepalive_monotonic = time.perf_counter()
+            self._stream_started_monotonic = time.perf_counter()
+            self._stream_needs_reconnect = False
+            self._stream_reconnect_not_before = None
+            self._stream_thread = threading.Thread(
+                target=self._stream_loop,
+                name="emaldo-e2e-stream",
+                daemon=True,
+            )
+            self._stream_thread.start()
+    def stop_stream(self) -> None:
+        """Signal the stream receiver to stop and join it (best effort)."""
+        self._stream_stop.set()
+        thread = self._stream_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._stream_thread = None
+
+    @property
+    def streaming(self) -> bool:
+        """True while the background stream receiver thread is running."""
+        t = self._stream_thread
+        return t is not None and t.is_alive()
+
+    def get_latest_power_flow(
+        self, max_age: float | None = None, device_id: str | None = None,
+    ) -> dict | None:
+        """Return the freshest streamed power-flow frame, or *None*.
+
+        If *device_id* is given, return only that device's cached frame.
+        If *None* (backward compat), return the latest frame across all
+        devices (useful for the startup frame-wait loop).
+
+        If *max_age* is given and the cached frame is older than that many
+        seconds, *None* is returned so the caller's stale/reconnect path can
+        rebuild a stalled stream.
+        """
+        with self._lock:
+            if device_id is not None:
+                data = self._latest_power_flow.get(device_id)
+                ts = self._latest_power_flow_monotonic.get(device_id)
+                if data is None:
+                    return None
+                if max_age is not None and ts is not None and (time.perf_counter() - ts) > max_age:
+                    return None
+                return dict(data)
+            # No device_id: return the most recent across all devices.
+            best_data = None
+            best_ts = 0.0
+            now = time.perf_counter()
+            for dev_id, data in self._latest_power_flow.items():
+                ts = self._latest_power_flow_monotonic.get(dev_id, 0.0)
+                if max_age is not None and (now - ts) > max_age:
+                    continue
+                if ts > best_ts:
+                    best_ts = ts
+                    best_data = data
+            return dict(best_data) if best_data else None
+
+    def _stream_loop(self) -> None:
+        """Background receiver: subscribe, drain pushes, re-subscribe, keepalive."""
+        while not self._stream_stop.is_set():
+            try:
+                with self._lock:
+                    if self._closed or self._sock is None:
+                        break
+                    if self._stream_needs_reconnect:
+                        # While a reconnect is pending (or its backoff window is
+                        # still open) skip subscribe/keepalive/drain on the dead
+                        # socket. The loop's poll-sleep below paces the backoff.
+                        self._stream_reconnect_locked()
+                    else:
+                        now = time.perf_counter()
+                        self._stream_watchdog_locked(now)
+                        self._stream_maybe_subscribe_locked(now)
+                        self._stream_maybe_keepalive_locked(now)
+                        self._stream_drain_locked()
+            except Exception as err:  # noqa: BLE001 - keep the loop alive
+                if self._log:
+                    self._log(f"Stream loop error: {err}")
+                self._stream_flag_reconnect(f"loop_exception:{type(err).__name__}")
+            self._stream_stop.wait(self._stream_poll_sleep)
+
+    def _stream_flag_reconnect(self, reason: str) -> None:
+        """Mark the stream for an in-place reconnect, recording why.
+
+        The reason counters are exposed via the diagnostic sensor so a reconnect
+        storm can be diagnosed from attributes alone (no debug logging needed).
+
+        Only force-refresh E2E credentials when the reconnect is caused by a
+        21204 (session expired).  Other reasons (long_stall, socket errors) do
+        NOT rotate chat_secret, breaking the death spiral where every reconnect
+        creates undecryptable pending packets (#47 beta15f).
+        """
+        # Always record the latest reason so the diagnostic sensor reflects the
+        # most recent trigger. The per-rebuild reason count is incremented in
+        # _stream_reconnect_locked (where the reconnect counter lives) so the
+        # reasons dict tracks actual rebuilds 1:1 instead of undercounting when a
+        # reconnect retries while the flag is already set (#47 beta16h-C4).
+        self._stream_last_reconnect_reason = reason
+        if "21204" in reason:
+            self._stream_needs_creds_refresh = True
+        self._stream_needs_reconnect = True
+
+    def stream_diagnostics(self) -> dict:
+        """Snapshot of stream counters for the diagnostic sensor."""
+        with self._lock:
+            return {
+                "frames": self._stream_frames_received,
+                "resubscribes": self._stream_resubscribes,
+                "reconnects": self._stream_reconnects,
+                "drain_packets": self._stream_drain_packets,
+                "drain_unparsed": self._stream_drain_unparsed,
+                "last_reconnect_reason": self._stream_last_reconnect_reason,
+                "reconnect_reasons": dict(self._stream_reconnect_reasons),
+                "creds_refresh_queued": self._stream_needs_creds_refresh,
+            }
+
+    def _stream_watchdog_locked(self, now: float) -> None:
+        """Force an in-place reconnect if the stream has stalled for too long.
+
+        This is the *only* stream teardown path. Short gaps are recovered by
+        the adaptive resubscribe without a handshake; only a prolonged stall
+        (frames stopped, or none ever arrived after start) rebuilds the
+        session — avoiding the fresh-handshake startup penalty on every minor
+        gap that the coordinator-level reconnect used to incur.
+
+        Uses the most recent timestamp across ALL devices' per-device caches
+        (#47 beta15f): if ANY device is still receiving frames, the stream is
+        considered alive.
+        """
+        if self._stream_needs_reconnect:
+            return
+        # Decrypt-gate check (#53 Q1/Q3): a reconnect that handshaked "ok" armed
+        # a deadline by which a fresh decrypted frame must arrive. A cleanly
+        # decrypted frame clears the deadline (in _stream_drain_locked). If the
+        # deadline passes with no fresh frame, the handshake succeeded but the
+        # chat_secret can no longer decrypt the push stream — escalate to a
+        # forced credential/home-secret refresh (same path as a 21204) so the
+        # next reconnect rotates the stale secret instead of wedging silently.
+        # This fires at most once per reconnect episode (the deadline is cleared
+        # here), so it cannot spam force-refresh (issue #53 Q2).
+        if (
+            self._stream_decrypt_gate_deadline is not None
+            and now > self._stream_decrypt_gate_deadline
+        ):
+            self._stream_decrypt_gate_deadline = None
+            if self._log:
+                self._log(
+                    "Stream reconnect handshaked ok but no decrypted frame "
+                    f"within {self._stream_decrypt_gate_window:.0f}s — "
+                    "escalating to forced credential refresh (#53)"
+                )
+            self._stream_needs_creds_refresh = True
+            self._stream_flag_reconnect("decrypt_gate_no_frame")
+            return
+        # Latest frame across all devices (per-device cache, beta15f)
+        latest_ts = max(self._latest_power_flow_monotonic.values()) if self._latest_power_flow_monotonic else None
+        reference = latest_ts if latest_ts is not None else self._stream_started_monotonic
+        if reference is None:
+            return
+        if (now - reference) > self._stream_long_stall:
+            if self._log:
+                kind = (
+                    "no frame since start"
+                    if latest_ts is None
+                    else "frames stopped"
+                )
+                self._log(
+                    f"Stream long-stall ({kind}, "
+                    f"{now - reference:.0f}s) — forcing in-place reconnect"
+                )
+            self._stream_flag_reconnect("long_stall")
+
+    def _stream_maybe_subscribe_locked(self, now: float) -> None:
+        """Send the 0x30 subscribe on the calm periodic schedule only.
+
+        The relay returns 21204 when 0x30 subscribes are spaced tighter than
+        ~10s, so we deliberately do NOT resubscribe adaptively to chase a
+        dropped frame — that triggered a reconnect storm (every early subscribe
+        landed inside the spacing wall, got 21204, forced a reconnect, and
+        restarted the device's ~15-20s stream-startup delay, so a frame never
+        arrived). Instead the interval stays comfortably above the wall, a
+        dropped subscribe-response is bridged by the wider stale window, and a
+        genuine outage is rebuilt by the long-stall watchdog.
+        """
+        last_sub = self._last_subscribe_monotonic
+        since_sub = float("inf") if last_sub is None else now - last_sub
+
+        # Hard rate limit — never violate the relay's ~10s spacing wall.
+        if since_sub < self._stream_min_resubscribe_gap:
+            return
+        # Periodic only: subscribe immediately after a (re)connect, then once
+        # per interval thereafter.
+        if last_sub is not None and since_sub < self._stream_resubscribe_interval:
+            return
+        if self._sock is None or self._addr is None:
+            return
+        pkt = build_subscription_packet(
+            self._creds, 0x30, self._session_nonce, payload=bytes([0x01]),
+        )
+        try:
+            self._sock.sendto(pkt, self._addr)
+        except OSError as err:
+            if self._log:
+                self._log(f"Stream subscribe send failed: {err}")
+            self._stream_flag_reconnect("subscribe_send_error")
+            return
+        self._last_subscribe_monotonic = now
+        self._stream_resubscribes += 1
+
+    def _stream_maybe_keepalive_locked(self, now: float) -> None:
+        """Send alive+wake+heartbeat (fire-and-forget) on the keepalive cadence."""
+        if (
+            self._last_keepalive_monotonic is not None
+            and (now - self._last_keepalive_monotonic) < self._stream_keepalive_interval
+        ):
+            return
+        if self._sock is None or self._addr is None:
+            return
+        try:
+            home_alive = build_alive_packet(
+                sender_end_id=self._creds["home_end_id"],
+                sender_group_id=self._creds["home_group_id"],
+                end_secret=self._creds["home_end_secret"],
+            )
+            dev_alive = build_alive_packet(
+                sender_end_id=self._creds["sender_end_id"],
+                sender_group_id=self._creds["sender_group_id"],
+                end_secret=self._creds["sender_end_secret"],
+            )
+            wake = build_wake_packet(self._creds, self._session_nonce)
+            heartbeat = build_heartbeat_packet(self._creds, self._session_nonce)
+            for pkt in (home_alive, dev_alive, wake, heartbeat):
+                self._sock.sendto(pkt, self._addr)
+        except OSError as err:
+            if self._log:
+                self._log(f"Stream keepalive send failed: {err}")
+            self._stream_flag_reconnect("keepalive_send_error")
+            return
+        self._last_keepalive_monotonic = now
+
+    def _stream_drain_locked(self, budget: int = 24) -> None:
+        """Drain currently-buffered datagrams, caching the freshest power flow.
+
+        Tries every known device secret on each datagram (#47 beta15f). When a
+        packet was encrypted for a different device on the same home, the own-
+        secret decrypt fails but the alt-key loop finds the right one.  Stores
+        per-device so each coordinator reads only its own data.
+        """
+        if self._sock is None:
+            return
+        alt_keys = dict(self._device_key_registry.get(self._home_id, {}))
+        # Resolve API device_id from registry (reverse lookup by chat_secret)
+        # so frames are stored under the key the coordinator uses to read.
+        # Fallback to sender_end_id if registry not yet populated (#47 beta15f).
+        own_chat_secret = self._creds.get("chat_secret", "")
+        own_device_id = self._creds.get("sender_end_id", "")
+        for _api_dev_id, _secret in alt_keys.items():
+            if _secret == own_chat_secret:
+                own_device_id = _api_dev_id
+                break
+        prev_timeout = self._sock.gettimeout()
+        self._sock.settimeout(self._stream_drain_timeout)
+        try:
+            for _ in range(budget):
+                try:
+                    resp, _ = self._sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                except OSError as err:
+                    if self._log:
+                        self._log(f"Stream drain socket error: {err}")
+                    self._stream_flag_reconnect("drain_socket_error")
+                    break
+                self._stream_drain_packets += 1
+                if self._is_session_expired(resp):
+                    if self._log:
+                        self._log("Stream saw 21204 — flagging reconnect")
+                    self._last_21204_monotonic = time.perf_counter()
+                    self._last_21204_stage = "stream"
+                    self._stream_flag_reconnect("session_expired_21204")
+                    break
+
+                # 1) Try own chat_secret first (fast path — most packets)
+                pf = self._try_parse_power_flow(resp)
+                dev_id = own_device_id
+                alt_hit = False
+
+                # 2) Alt-key loop: try every other device's secret (#47 beta15f)
+                if pf is None and alt_keys:
+                    for alt_dev_id, alt_secret in alt_keys.items():
+                        if alt_secret == self._creds.get("chat_secret"):
+                            continue  # already tried via own-creds path
+                        pf = self._try_parse_power_flow(resp, chat_secret=alt_secret)
+                        if pf is not None:
+                            dev_id = alt_dev_id
+                            alt_hit = True
+                            if self._log:
+                                self._log(
+                                    f"[E2E] multi-key decrypt: device={alt_dev_id} "
+                                    f"works (alt_key, TLV raw={resp[:48].hex()})"
+                                )
+                            break
+
+                if pf is not None:
+                    _now_pf = time.perf_counter()
+                    self._latest_power_flow[dev_id] = pf
+                    self._latest_power_flow_monotonic[dev_id] = _now_pf
+                    self._stream_frames_received += 1
+                    # Decrypt-gate bookkeeping (#53 Q1/Q3): a frame decrypted
+                    # cleanly, so the current chat_secret is valid. Record the
+                    # time, mark the session as having ever decrypted, and clear
+                    # any pending reconnect decrypt-gate deadline.
+                    self._stream_last_decrypted_frame_ts = _now_pf
+                    self._stream_ever_decrypted = True
+                    self._stream_decrypt_gate_deadline = None
+                    continue
+
+                rf = self._try_parse_regulate_frequency(resp)
+                if rf is not None:
+                    self._regulate_frequency_cache = rf
+                    continue
+
+                # Force-logout detection (#47): the relay may send an encrypted
+                # JSON datagram {"cmd":"force-logout"} when the home end_secret
+                # was rotated by another device.  Decrypt with home_end_secret
+                # and flag a reconnect + home-level refresh.
+                home_secret = self._creds.get("home_end_secret", "")
+                if home_secret:
+                    try:
+                        decoded = decrypt_response(
+                            resp,
+                            home_secret,
+                            payload_validator=lambda d: (
+                                b"logout" in d
+                            ),
+                        )
+                        if decoded is not None:
+                            text = decoded.decode("utf-8", errors="replace")
+                            if self._log:
+                                self._log(
+                                    f"Force-logout from relay: {text}"
+                                )
+                            self._stream_flag_reconnect("force_logout")
+                            self._stream_needs_creds_refresh = True
+                            break
+                    except Exception:
+                        pass
+
+                # A datagram we received but could not classify — track it so a
+                # "frames=0 but packets>0" situation is visible in diagnostics.
+                self._stream_drain_unparsed += 1
+        finally:
+            try:
+                self._sock.settimeout(prev_timeout)
+            except OSError:
+                pass
+
+    def _refresh_creds_locked(self) -> None:
+        """Pull the latest (shared) credentials before re-handshaking.
+
+        A 21204 means the device ``chat_secret`` was rotated (typically by a
+        concurrent REST ``e2e_login``). Re-handshaking with the stale secret
+        would just 21204 again, so fetch the current secret via the provider.
+        Best-effort: on any failure keep the existing creds and let the
+        handshake proceed (it may still fail and retry).
+
+        Only calls the provider with ``force_refresh=True`` when the reconnect
+        was triggered by a 21204 (``_stream_needs_creds_refresh``). Other
+        reconnect reasons (``long_stall``, socket errors) refresh via normal
+        TTL expiry, avoiding the chat_secret rotation that turns every reconnect
+        into a self-inflicted decrypt failure (#47 beta15f).
+        """
+        if self._creds_provider is None:
+            return
+        needs_force = self._stream_needs_creds_refresh
+        self._stream_needs_creds_refresh = False
+        # Release lock before calling creds_provider to prevent self-deadlock:
+        # _creds_provider → _get_home_e2e → fires home_secret_callbacks →
+        # rekey_home() → tries self._lock (already held by stream thread).
+        # Re-acquire after the call completes (#47).
+        self._lock.release()
+        try:
+            fresh = self._creds_provider(force_refresh=needs_force)
+        except Exception as err:  # noqa: BLE001 - best effort
+            self._lock.acquire()
+            if self._closed:
+                return
+            if self._log:
+                self._log(f"Stream creds refresh failed: {err}")
+            # Re-arm the flag so the next reconnect retries the forced refresh.
+            if needs_force:
+                self._stream_needs_creds_refresh = True
+            return
+        self._lock.acquire()
+        if self._closed:
+            return
+        if fresh:
+            self._creds = fresh
+            if self._log:
+                why = " (forced by 21204)" if needs_force else ""
+                self._log(f"Stream creds refreshed{why}")
+
+    def _stream_reconnect_locked(self) -> None:
+        """Rebuild the session after a 21204/socket error and re-subscribe.
+
+        The backoff wait is NON-BLOCKING: instead of ``time.sleep(backoff)``
+        while holding ``self._lock`` (which stalled every concurrent read for up
+        to the 30 s ceiling), the first call schedules a monotonic deadline and
+        returns. The stream loop releases the lock between its 0.1 s poll-sleeps,
+        so reads stay responsive while the backoff elapses. When the deadline
+        passes a later call performs the actual rebuild.
+
+        Escalation only grows across consecutive FAILED handshakes (a genuinely
+        penalized relay). A successful handshake — or any received frame —
+        resets the streak so a single competing read cannot ratchet the backoff
+        up to the ceiling (beta13e).
+        """
+        if self._closed:
+            return
+        now = time.perf_counter()
+
+        # First call after the reconnect was flagged: schedule the backoff.
+        if self._stream_reconnect_not_before is None:
+            # A frame since the last reconnect means the relay is healthy again.
+            if (
+                self._stream_frames_received
+                != self._stream_reconnect_backoff_anchor_frames
+            ):
+                self._stream_reconnect_streak = 0
+                self._stream_reconnect_backoff_anchor_frames = (
+                    self._stream_frames_received
+                )
+            backoff = min(
+                self.RECONNECT_BACKOFF_SECONDS * (2 ** self._stream_reconnect_streak),
+                self._stream_reconnect_backoff_max,
+            )
+            self._stream_reconnect_streak += 1
+            self._stream_reconnect_not_before = now + backoff
+            if self._log:
+                self._log(
+                    f"Stream reconnect scheduled in {backoff:.1f}s "
+                    f"(streak={self._stream_reconnect_streak}, "
+                    f"stage={self._last_21204_stage or 'unknown'})"
+                )
+            return
+
+        # Backoff window still open — let the loop keep cycling (lock released).
+        if now < self._stream_reconnect_not_before:
+            return
+
+        # Deadline reached: perform the actual rebuild.
+        self._stream_reconnect_not_before = None
+        try:
+            # If a forced credential refresh is already pending (a 21204 flagged
+            # it, or the decrypt-gate escalated because handshake-ok frames never
+            # decrypted — #53 Q1/Q3), refresh creds BEFORE the first reconnect.
+            # Otherwise the re-handshake reuses the stale chat_secret, succeeds
+            # at the transport level, and the decrypt gate would loop forever
+            # because the force flag is only consumed by _refresh_creds_locked.
+            if self._stream_needs_creds_refresh:
+                self._refresh_creds_locked()
+            # Try re-handshake with current creds first (#47 beta16b).
+            # If handshake succeeds, creds are still valid — skip the
+            # expensive cloud force_refresh that can trigger dual-unit
+            # home-secret rotation ping-pong.
+            self._reconnect()
+            if self._last_handshake_response != "ok":
+                # Stale creds — fetch fresh ones and reconnect again.
+                self._refresh_creds_locked()
+                self._reconnect()
+                if self._last_handshake_response != "ok":
+                    # Second attempt also failed — re-arm the forced-refresh
+                    # flag so the next retry escalates the generation counter
+                    # and triggers a home-level secret rotation (#41 #47).
+                    self._stream_needs_creds_refresh = True
+                    raise EmaldoE2ESessionExpired(
+                        "Reconnect with refreshed creds also failed"
+                    )
+            self._stream_needs_creds_refresh = False
+            self._stream_needs_reconnect = False
+            self._last_subscribe_monotonic = None  # force immediate re-subscribe
+            self._last_keepalive_monotonic = time.perf_counter()
+            self._stream_started_monotonic = time.perf_counter()  # reset watchdog
+            self._stream_reconnects += 1
+            # Count the reason on the actual rebuild so it stays in lockstep with
+            # the reconnect counter (one entry per rebuild, not per flag-set).
+            _r = self._stream_last_reconnect_reason or "unknown"
+            self._stream_reconnect_reasons[_r] = (
+                self._stream_reconnect_reasons.get(_r, 0) + 1
+            )
+            # A successful handshake clears the escalation: the next 21204 starts
+            # fresh at the base backoff instead of inheriting a tall streak.
+            self._stream_reconnect_streak = 0
+            self._stream_reconnect_backoff_anchor_frames = self._stream_frames_received
+            # Decrypt-gated reconnect success (#53 Q1/Q3): a handshake-ok does
+            # NOT prove the chat_secret can still decrypt frames. If this session
+            # has ever decrypted a frame (i.e. it was genuinely healthy before),
+            # arm a deadline by which a fresh decrypted frame must arrive. If the
+            # watchdog sees the deadline pass with no fresh frame it escalates to
+            # a forced credential/home-secret refresh — closing the "handshake ok
+            # but stream never decrypts" stall (issue #53, was a 6h wedge). A
+            # never-yet-decrypted session (cold start / inverter offline) is not
+            # gated, so a legitimately idle relay is never punished.
+            if self._stream_ever_decrypted:
+                self._stream_decrypt_gate_deadline = (
+                    time.perf_counter() + self._stream_decrypt_gate_window
+                )
+            else:
+                self._stream_decrypt_gate_deadline = None
+        except Exception as err:  # noqa: BLE001 - best-effort reconnect
+            if self._log:
+                self._log(f"Stream reconnect failed: {err}")
+            # Re-arm so the next loop iteration schedules a fresh (escalated)
+            # backoff window; the flag stays set so the loop keeps retrying.
+            self._stream_reconnect_not_before = None
 
     def read_regulate_frequency_state(self) -> dict | None:
         """Read FCR/mFRR frequency regulation state (0x45) over the existing session.
@@ -3191,27 +4318,138 @@ class PersistentE2ESession:
             # No explicit response — fall back to any passively-captured push.
             return self._regulate_frequency_cache
 
-    def _try_parse_regulate_frequency(self, resp: bytes) -> dict | None:
-        """Decrypt+parse a response as a regulate-frequency payload. Returns None on mismatch."""
+    def _try_parse_regulate_frequency(self, resp: bytes, chat_secret: str | None = None) -> dict | None:
+        """Decrypt+parse a response as a regulate-frequency payload. Returns None on mismatch.
+
+        chat_secret — when provided (secondary device read), use this key for
+        AES-CBC decryption instead of self._creds["chat_secret"].
+        """
+        key = chat_secret if chat_secret is not None else self._creds["chat_secret"]
         try:
             decrypted = decrypt_response(
-                resp, self._creds["chat_secret"],
+                resp, key,
                 payload_validator=_is_regulate_frequency_payload,
             )
         except Exception:  # noqa: BLE001 - best-effort parse
             return None
         return parse_regulate_frequency_state(decrypted)
 
-    def _try_parse_power_flow(self, resp: bytes) -> dict | None:
-        """Decrypt+parse a response as a power flow payload. Returns None on mismatch."""
+    def _try_parse_power_flow(self, resp: bytes, chat_secret: str | None = None) -> dict | None:
+        """Decrypt+parse a response as a power flow payload. Returns None on mismatch.
+
+        chat_secret — when provided (secondary device read), use this key for
+        AES-CBC decryption instead of self._creds["chat_secret"].
+        """
+        global _pf_rejected_count, _pf_rejected_window_start, _pf_rejected_window_s, _pf_rejected_lock
+        key = chat_secret if chat_secret is not None else self._creds["chat_secret"]
         try:
             decrypted = decrypt_response(
-                resp, self._creds["chat_secret"],
+                resp, key,
                 payload_validator=_is_power_flow_payload,
+                fallback_ivs=[self._session_nonce.encode()],
             )
-        except Exception:  # noqa: BLE001 - best-effort parse
+        except Exception as exc:  # noqa: BLE001 - best-effort parse
+            if self._log:
+                self._log(
+                    f"  _try_parse_power_flow: decrypt_response raised: {exc}"
+                )
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "  _try_parse_power_flow: decrypt exception resp (%dB) hex=%s",
+                    len(resp), resp.hex(),
+                )
             return None
-        return parse_power_flow(decrypted)
+        if decrypted is None:
+            # Fallback: home-level chat_secret (#47 beta15h)
+            home_secret = self._creds.get("home_chat_secret", "")
+            if home_secret and home_secret != key:
+                try:
+                    decrypted = decrypt_response(
+                        resp, home_secret,
+                        payload_validator=_is_power_flow_payload,
+                        fallback_ivs=[self._session_nonce.encode()],
+                    )
+                except Exception:  # noqa: BLE001 - best-effort parse
+                    pass
+                # Per-packet step logs flood the log on non-power-flow pushes.
+                # Coalesce to one line per window (first event immediate).
+                if _LOGGER.isEnabledFor(logging.DEBUG) or self._log:
+                    with _pf_rejected_lock:
+                        _pf_rejected_count += 1
+                        now = time.monotonic()
+                        if _pf_rejected_window_start == 0.0:
+                            n = _pf_rejected_count
+                            _pf_rejected_count = 0
+                            _pf_rejected_window_start = now
+                            _flush = True
+                        elif now - _pf_rejected_window_start \
+                                >= _pf_rejected_window_s:
+                            n = _pf_rejected_count
+                            _pf_rejected_count = 0
+                            _pf_rejected_window_start = now
+                            _flush = True
+                        else:
+                            n = None
+                            _flush = False
+                    if _flush:
+                        msg = (
+                            f"  _try_parse_power_flow: device key failed -> "
+                            f"tried home_chat_secret (resp {len(resp)}B)"
+                            + (f" [x{n} in window]" if n else "")
+                        )
+                        if self._log:
+                            self._log(msg)
+                        if _LOGGER.isEnabledFor(logging.DEBUG):
+                            _LOGGER.debug(
+                                "  _try_parse_power_flow: device key failed -> "
+                                "tried home_chat_secret resp (%dB)",
+                                len(resp),
+                            )
+        if decrypted is None:
+            if _LOGGER.isEnabledFor(logging.DEBUG) or self._log:
+                with _pf_rejected_lock:
+                    _pf_rejected_count += 1
+                    now = time.monotonic()
+                    if _pf_rejected_window_start == 0.0:
+                        n = _pf_rejected_count
+                        _pf_rejected_count = 0
+                        _pf_rejected_window_start = now
+                        _flush = True
+                    elif now - _pf_rejected_window_start \
+                            >= _pf_rejected_window_s:
+                        n = _pf_rejected_count
+                        _pf_rejected_count = 0
+                        _pf_rejected_window_start = now
+                        _flush = True
+                    else:
+                        n = None
+                        _flush = False
+                if _flush:
+                    msg = (
+                        f"  _try_parse_power_flow: decrypt_response=None "
+                        f"(resp {len(resp)}B)"
+                        + (f" [x{n} in window]" if n else "")
+                    )
+                    if self._log:
+                        self._log(msg)
+                    if _LOGGER.isEnabledFor(logging.DEBUG):
+                        _LOGGER.debug(
+                            "  _try_parse_power_flow: decrypt=None resp (%dB)",
+                            len(resp),
+                        )
+            return None
+        if self._log:
+            self._log(
+                f"  _try_parse_power_flow: decrypted OK ({len(decrypted)}B): "
+                f"{decrypted[:48].hex()}"
+            )
+        result = parse_power_flow(decrypted)
+        if result is None and self._log:
+            self._log(
+                f"  _try_parse_power_flow: parse_power_flow FAILED "
+                f"(decrypted {len(decrypted)}B)"
+            )
+        return result
 
     def read_selling_protection(self) -> dict | None:
         """Read selling-protection state (0x5F) over the existing session.
@@ -3474,7 +4712,7 @@ class PersistentE2ESession:
                             continue
 
                         seen_serials.add(serial)
-                        info["scan_index"] = idx
+                        info["scan_index"] = info.get("index", idx)
                         batteries.append(info)
                         found_in_tier += 1
                         if self._log:
@@ -3540,8 +4778,39 @@ class PersistentE2ESession:
             )
             return self._send_raw(pkt, f"Command(0x{msg_type:02x})")
 
+    def send_command_for_creds(self, msg_type: int, payload: bytes, target_creds: dict) -> bytes | None:
+        """Send a write command using *target_creds* instead of own credentials.
+
+        Uses the established session socket but encrypts the packet with
+        *target_creds* (different ``chat_secret`` / ``sender_end_id``) so the
+        relay routes the command to the correct device when the session is
+        shared across multiple devices on one home.
+
+        Does NOT send ``Alive(home)`` — the session must already be alive.
+        Returns the relay's response bytes, or *None* on timeout / closed session.
+        """
+        with self._lock:
+            if self._sock is None or self._closed:
+                raise EmaldoE2EError("Session is not connected")
+            # On a shared home session the relay binds the socket to the
+            # handshake device. Cross-device commands must use the session
+            # owner's sender fields + chat_secret for the relay to accept;
+            # the target device is addressed via recipient_end_id (#47).
+            wire_creds = dict(target_creds)
+            if self._creds is not None and target_creds.get("sender_end_id") != self._creds.get("sender_end_id"):
+                wire_creds["sender_end_id"] = self._creds["sender_end_id"]
+                wire_creds["sender_group_id"] = self._creds["sender_group_id"]
+                wire_creds["chat_secret"] = self._creds["chat_secret"]
+            pkt = build_subscription_packet(
+                wire_creds, msg_type, self._session_nonce, payload=payload,
+            )
+            return self._send_raw(pkt, f"Command(0x{msg_type:02x})")
+
     def close(self) -> None:
         """Close the socket and mark the session closed."""
+        # Signal the stream receiver to stop before taking the lock so it can
+        # exit its loop; it is a daemon thread and will not block shutdown.
+        self._stream_stop.set()
         with self._lock:
             self._closed = True
             if self._sock is not None:

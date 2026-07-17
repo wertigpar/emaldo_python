@@ -1,8 +1,9 @@
-
+﻿
 ## 1. Transport
 
 - **UDP**, raw MSCT binary frames (NOT KCP)
-- **Relay**: `e2e2.emaldo.com:1050` (IP `35.187.68.18`)
+- **Relay**: `e2e2.emaldo.com:1050` (IP `35.187.68.18`) â€” hostname is API-returned
+  by ``e2e-user-login``; ``e2e2`` is the default fallback when the API omits it.
 - No TCP fallback; all E2E traffic goes through the cloud relay to the device
 
 ---
@@ -12,20 +13,21 @@
 ### 2.1 REST API (HTTPS)
 
 - **RC4** symmetric cipher (key = `app_secret` from credentials)
-- Responses are **RC4 decrypted → Snappy decompressed**
-- Request fields sent as `encrypt_field(json_string)` → RC4 → hex string
+- Responses are **RC4 decrypted â†’ Snappy decompressed**
+- Request fields sent as `encrypt_field(json_string)` â†’ RC4 â†’ hex string
 - See `emaldo/crypto.py`
 
 ### 2.2 E2E UDP
 
 - **AES-256-CBC** with **PKCS#7** padding
 - IV = session nonce (16-byte ASCII alphanumeric string sent in-band)
-- Two distinct keys — determined by packet type:
+- Two distinct keys â€” determined by packet type:
 
 | Key | Field in credentials | Used for |
 |-----|---------------------|----------|
 | `end_secret` | `home_end_secret` / `sender_end_secret` | Alive packets (relay auth) |
 | `chat_secret` | `chat_secret` | Heartbeat, wake, all device commands |
+| `home_chat_secret` | `home_chat_secret` | Fallback AES key for power-flow decrypt (shared across devices on the same home) |
 
 ---
 
@@ -43,6 +45,7 @@ All obtained via `EmaldoClient.e2e_login()` (REST API call to `/bmt/search-bmt/`
 | `home_end_id` | `str (32 chars)` | Home hub endpoint ID |
 | `home_group_id` | `str (32 chars)` | Home hub group ID |
 | `home_end_secret` | `str (32 chars)` | Home hub end secret |
+| `home_chat_secret` | `str (32 chars)` | Shared AES fallback key for power-flow decrypt |
 | `chat_secret` | `str (32 chars)` | AES key for all device communication |
 
 ---
@@ -54,7 +57,7 @@ All obtained via `EmaldoClient.e2e_login()` (REST API call to `/bmt/search-bmt/`
 Command codes are encoded as a 16-bit value where the high byte is the mode and the low byte is the type.
 On the wire these are **byte-swapped** to `[type_byte, mode_byte]`.
 
-Example: code `0xA041` → wire bytes `[0x41, 0xA0]` → `msg_type=0x41, mode=0xA0`.
+Example: code `0xA041` â†’ wire bytes `[0x41, 0xA0]` â†’ `msg_type=0x41, mode=0xA0`.
 
 ### 4.2 Mode Bytes
 
@@ -115,17 +118,19 @@ Uses `chat_secret`. Payload is `{"__time": <unix_ts>}` JSON.
 ### 4.6 Wake Packet
 
 Similar to heartbeat but `METHOD` is `0x84 0xF5 b"wake"` (4-byte string).
-No MSGID+CT suffix — the MSGID tag byte is `0x1B 0xF6` and is the last field.
+No MSGID+CT suffix â€” the MSGID tag byte is `0x1B 0xF6` and is the last field.
 Uses `chat_secret`.
 
 ### 4.7 Override Packet (special)
 
-Type `0x1A`. Has a slightly different structure: uses `0x84 0xF1 0x00 0x00 0x00 0x01` (4-byte PROXY) and no APP_ID. Payload format:
+Type `0x1A`. Has a slightly different structure: uses `0x84 0xF1 0x00 0x00 0x00 0x01`
+(4-byte PROXY) and the MSGID tag uses a different prefix (`0xA0 0x9B 0xF6` instead of
+`0x9B 0xF6`). APP_ID **is** present. Payload format:
 
 ```
 byte 0:   high_marker     (battery % charge cutoff, default 72)
 byte 1:   low_marker      (battery % discharge cutoff, default 20)
-byte 2:   version_flag    (0x00)
+byte 2:   battery_range_override    (0x00 = AI range, 0x01 = override mode)
 byte 3:   slot_count      (0x60=96 slots today, 0xC0=192 slots today+tomorrow)
 bytes 4+: slot_values     (96 or 192 bytes)
 ```
@@ -137,12 +142,12 @@ bytes 4+: slot_values     (96 or 192 bytes)
 Every interaction requires a full handshake before sending commands:
 
 ```
-1. Alive(home)   — sender=home_end_id, key=home_end_secret   → relay auth for hub
-2. Alive(device) — sender=sender_end_id, key=sender_end_secret → relay auth for app
-3. Wake          — key=chat_secret, wakes relay routing table
-4. Heartbeat     — key=chat_secret
+1. Alive(home)   â€” sender=home_end_id, key=home_end_secret   â†’ relay auth for hub
+2. Alive(device) â€” sender=sender_end_id, key=sender_end_secret â†’ relay auth for app
+3. Wake          â€” key=chat_secret, wakes relay routing table
+4. Heartbeat     â€” key=chat_secret
 5. sleep(0.2s)
-6. Command(s)    — key=chat_secret
+6. Command(s)    â€” key=chat_secret
 ```
 
 Each session uses a fresh **session nonce** (16-char random alphanumeric).
@@ -170,41 +175,105 @@ Typical relay responses by size:
 ### 5.2 Keepalive
 
 To extend a session beyond the default TTL, send the **full 4-packet handshake
-sequence** (same as the initial session handshake, steps 1–4 above) at intervals
+sequence** (same as the initial session handshake, steps 1â€“4 above) at intervals
 shorter than the relay TTL. Sending only `dev_alive + heartbeat` is insufficient
-— the relay responds with 163 B (subscription ACK/"nothing new") and does **not**
+â€” the relay responds with 163 B (subscription ACK/"nothing new") and does **not**
 reset the session timer.
 
-Recommended keepalive interval: **≤10 seconds** between sends.
+Recommended keepalive interval: **â‰¤10 seconds** between sends.
 
-After session expiry, do **not** attempt to reconnect immediately. Wait for the
-relay reject window (~30 s) to pass before starting a new handshake.
+After session expiry, the integration applies an **adaptive backoff**
+(`RECONNECT_BACKOFF_SECONDS`, â‰ˆ2 s base, escalated on repeated failures) before
+re-handshaking on the same socket, rather than waiting out the full reject
+window. It first retries with the current credentials (UDP-only), and only
+refreshes cloud credentials if the re-handshake still returns non-`ok`.
 
 ### 5.3 Persistent Session Polling
 
 For real-time monitoring, opening a fresh socket and running the full handshake
-on every read is too expensive. `PersistentE2ESession` (in `emaldo/e2e.py`)
+on every read is too expensive. `PersistentE2ESession` (in `emaldo_lib/e2e.py`)
 performs the handshake **once**, keeps a single UDP socket open, and re-uses it
 for each subsequent read (e.g. `0x30` power flow), completing in one
 request/response round trip.
 
-When polling a single long-lived socket, the relay drops the session after
-roughly **10 seconds** of inactivity (versus the ~30 s TTL for the full
-handshake flow). To keep the socket alive, send a keepalive (a fresh
-`alive(home) + alive(device) + heartbeat`) every **~7 seconds** from a
-background thread/task (`DEFAULT_KEEPALIVE_INTERVAL = 7`).
+**Per-device sessions (#47 Option C / beta16h-C3):** each device on a home
+creates its *own* `PersistentE2ESession` (its own socket, its own stream
+thread) and establishes it as itself via its own
+`Alive(home)+Alive(device)+Wake+Heartbeat`. The relay pushes frames for *all*
+home devices to every open socket, so each session also receives the other
+device's frames â€” but it only decrypts its own device's frames (the others
+fail decryption and are classified as status/control pushes). This avoids the
+relay `Alive(home)` collision that occurred with a single shared session.
+
+To keep the socket alive, send a keepalive (a fresh
+`alive(home) + alive(device) + heartbeat`) every **~7 seconds** from the
+session's background stream thread (`DEFAULT_KEEPALIVE_INTERVAL = 7`).
 
 **21204 recovery (in place):** if a read or keepalive observes a `21204`
 (session expired), the session re-handshakes on the **same** socket. Because the
-relay rejects re-handshakes made immediately after expiry, it waits
-`RECONNECT_BACKOFF_SECONDS` (≈2 s) before rebuilding. The keepalive path stays
-non-blocking and never sleeps/re-handshakes itself — it returns `False` on
-21204 so the caller tears the dead session down and the next `read_power_flow`
-rebuilds it.
+relay rejects re-handshakes made immediately after expiry, it applies an
+adaptive backoff (`RECONNECT_BACKOFF_SECONDS`, â‰ˆ2 s base, escalated on
+repeated failures) before rebuilding. On a 21204 the session first tries a
+re-handshake with the *current* credentials (UDP-only, no cloud call); only if
+that still returns non-`ok` does it refresh credentials and retry. A successful
+reconnect clears the escalation streak.
 
 **Diagnostics:** a live session exposes `last_rtt_ms` (last UDP round-trip),
 `last_keepalive_failure_reason`, and `last_power_flow_diag` (per-read counters:
 initial timeout / session-expired / non-matching, plus drained-packet counts).
+It also tracks `stream_reconnects` / `stream_reconnect_reasons` (cumulative
+reconnect-cause breakdown) surfaced via the "Realtime connection" diagnostic
+sensor.
+
+### 5.4 Multi-Device Session Management (#47 â€” per-device sessions + home-secret coordination)
+
+**Problem:** ``/home/e2e-login/`` rotates the shared ``home_end_secret``
+server-side on every call. When two devices on the same account both need fresh
+credentials, they can race: Device A's refresh rotates the secret â†’ Device B's
+live session receives a ``force-logout`` from the relay â†’ Device B calls
+``/home/e2e-login/`` to recover â†’ secret rotates back â†’ Device A gets
+``force-logout`` â†’ infinite ping-pong (mutual 21204 storm).
+
+**Per-device sessions (Option C / beta16h-C3):** each device owns its own
+``PersistentE2ESession`` and its own socket, so there is no shared-session
+``Alive(home)`` collision. The remaining risk is the home-secret rotation
+ping-pong, addressed by the coordination below.
+
+**Primary publishes, secondary never rotates:** only the **primary** device
+(per-home deterministic election across all config entries sharing a home_id)
+publishes ``home_end_secret`` / ``home_chat_secret`` to a shared dict at
+session creation. Secondary devices override their REST-fetched home secret
+with the primary's published value and pass ``allow_home_refresh=False``, so
+they can **never** escalate to ``force_home_refresh=True``. Only the primary can
+rotate the shared home secret; the secondary always reuses the primary's value.
+
+**Per-home serialization lock:** ``EmaldoClient._get_home_e2e()`` still
+serializes concurrent ``/home/e2e-login/`` calls per ``home_id`` using a
+``threading.Lock``. A 5-second grace window (``_home_e2e_cache`` age < 5 s)
+reuses cached credentials when ``force_refresh`` is requested, preventing
+back-to-back rotations when two devices escalate simultaneously. The home login
+result has its own 30-minute TTL, separate from the per-device 10-minute
+``e2e_login`` cache.
+
+**Home secret rotation callbacks:** Registered by each live
+``PersistentE2ESession`` via ``register_home_secret_callback()``. When
+``_get_home_e2e()`` returns fresh data (cache miss, or force-refresh), it fires
+all registered callbacks. Each callback calls ``session.rekey_home(home_data)``
+to update the in-memory ``home_end_id``, ``home_group_id``,
+``home_end_secret``, and ``home_chat_secret`` without a UDP re-handshake. The
+callbacks are fired outside the per-home lock to avoid deadlock with the
+session's own lock.
+
+**Force-logout datagram detection:** The relay may send an encrypted JSON
+datagram ``{"cmd":"force-logout"}`` when the home ``end_secret`` was rotated by
+another device. The stream drain loop decrypts it with the cached
+``home_end_secret``, flags a reconnect with ``_stream_needs_creds_refresh =
+True``, and the session re-keys on the next handshake.
+
+**Callback cleanup:** ``_invalidate_session_ref()`` calls the unregister
+callable returned by ``register_home_secret_callback()``, ensuring a stale
+session is not re-keyed after the coordinator has moved to a replacement
+session.
 
 ---
 
@@ -213,25 +282,25 @@ initial timeout / session-expired / non-matching, plus drained-packet counts).
 | Type | Mode | Direction | Payload | Response |
 |------|------|-----------|---------|----------|
 | `0x01` | `0xA0` | Write | `[on u8, start u32le, end u32le]` 9B (zeros=cancel) | ACK 161B |
-| `0x05` | `0xA0` | Write | `[on u8, len u8, user_id utf8]` | set_virtualpowerplant – Sell Back to Grid (fire-and-forget; user_id required for auth) |
-| `0x06` | `0x10` | Read | `[cabinet_idx u8]` 1B | Battery info ≥80B |
-| `0x06` | `0xA0` | Subscribe | (empty) | get_virtualpowerplant – sell-back state 1B |
-| `0x1A` | `0xA0` | Write | Override payload (see §4.7) | ACK 161B |
-| `0x1B` | `0xA0` | Subscribe | (empty) | Override state (see §7.2) |
+| `0x05` | `0xA0` | Write | `[on u8, len u8, user_id utf8]` | set_virtualpowerplant â€“ Sell Back to Grid (fire-and-forget; user_id required for auth) |
+| `0x06` | `0x10` | Read | `[cabinet_idx u8]` 1B | Battery info â‰¥80B |
+| `0x06` | `0xA0` | Subscribe | (empty) | get_virtualpowerplant â€“ sell-back state 1B |
+| `0x1A` | `0xA0` | Write | Override payload (see Â§4.7) | ACK 161B |
+| `0x1B` | `0xA0` | Subscribe | (empty) | Override state (see Â§7.2) |
 | `0x20` | `0xA0` | Subscribe | (empty) | EV charging mode 6B |
 | `0x22` | `0xA0` | Write | EV smart mode 9B | ACK |
 | `0x29` | `0xA0` | Write | `[instant_on u8]` 1B | ACK |
-| `0x30` | `0xA0` | Subscribe | `[0x01]` 1B | Power flow 20–22B |
+| `0x30` | `0xA0` | Subscribe | `[0x01]` 1B | Power flow 20â€“22B |
 | `0x31` | `0xA0` | Write | EV instant mode 4B | ACK |
 | `0x41` | `0xA0` | Write | `[on u8]` 1B (1=on,0=off) | ACK (fire-and-forget) |
-| `0x45` | `0xA0` | Subscribe | (empty) | FCR/mFRR state 2–4B |
+| `0x45` | `0xA0` | Subscribe | (empty) | FCR/mFRR state 2â€“4B |
 | `0x57` | `0xA0` | Write | `[enabled u8]` 1B | ACK |
 | `0x58` | `0xA0` | Write | `[peak_pct u8, ups_pct u8]` 2B | ACK |
 | `0x5A` | `0xA0` | Write | Peak schedule 15B+ | ACK |
 | `0x5B` | `0xA0` | Subscribe | (empty) | Peak shaving config 20B |
 | `0x5C` | `0xA0` | Subscribe | (empty) | Peak schedule 28B |
-| `0x5E` | `0xA0` | Write | `[on u8, threshold u32le]` 5B | set_sellingprotection – Sell Limit cap in kWh/day (fire-and-forget) |
-| `0x5F` | `0xA0` | Subscribe | (empty) | get_sellingprotection – selling protection state 6B |
+| `0x5E` | `0xA0` | Write | `[on u8, threshold u32le]` 5B | set_sellingprotection â€“ Sell Limit cap in kWh/day (fire-and-forget) |
+| `0x5F` | `0xA0` | Subscribe | (empty) | get_sellingprotection â€“ selling protection state 6B |
 | `0x77` | `0xA0` | Write | `[redundancy u8]` 1B | ACK |
 | `0x80` | `0xA0` | Write | `[on u8, target u32le, expand u8]` 6B | ACK |
 | `0x81` | `0xA0` | Subscribe | `b""` | Manual selling state 10B |
@@ -242,63 +311,63 @@ initial timeout / session-expired / non-matching, plus drained-packet counts).
 
 All payloads are little-endian unless noted.
 
-### 7.1 Power Flow (`0x30`, 20–22 bytes)
+### 7.1 Power Flow (`0x30`, 20â€“22 bytes)
 
 | Offset | Type | Field | Notes |
 |--------|------|-------|-------|
-| 0–1 | `s16` | `battery_w` | ×100 W; positive=charging, negative=discharging |
-| 2–3 | `s16` | `solar_w` | ×100 W |
-| 4–5 | `s16` | `grid_w` | ×100 W; positive=import, negative=export |
-| 6–7 | `s16` | `addition_load_w` | ×100 W |
-| 8–9 | `s16` | `other_load_w` | ×100 W |
-| 10–11 | `s16` | `ev_w` | ×100 W |
-| 12–13 | `u16` | `ip2_w` | ×100 W (unsigned) |
-| 14–15 | `u16` | `op2_w` | ×100 W (unsigned) |
+| 0â€“1 | `s16` | `battery_w` | Ã—100 W; positive=charging, negative=discharging |
+| 2â€“3 | `s16` | `solar_w` | Ã—100 W |
+| 4â€“5 | `s16` | `grid_w` | Ã—100 W; positive=import, negative=export |
+| 6â€“7 | `s16` | `addition_load_w` | Ã—100 W |
+| 8â€“9 | `s16` | `other_load_w` | Ã—100 W |
+| 10â€“11 | `s16` | `ev_w` | Ã—100 W |
+| 12â€“13 | `u16` | `ip2_w` | raw W (unsigned, not Ã—100) |
+| 14â€“15 | `u16` | `op2_w` | raw W (unsigned, not Ã—100) |
 | 16 | `u8` | `grid_valid` | 1 = CT sensor present |
 | 17 | `u8` | `bsensor_valid` | 1 = battery sensor present |
 | 18 | `u8` | `solar_efficiency` | enum |
 | 19 | `u8` | `thirdparty_pv_on` | 1 = third-party PV enabled |
-| 20–21 | `s16` | `dual_power_w` | ×100 W |
+| 20â€“21 | `s16` | `dual_power_w` | Ã—100 W |
 
-### 7.2 Override State (`0x1B`, ≥105 bytes)
+### 7.2 Override State (`0x1B`, â‰¥105 bytes)
 
 | Offset | Type | Field | Notes |
 |--------|------|-------|-------|
 | 0 | `u8` | `high_marker` | Charge cutoff % (default 72) |
 | 1 | `u8` | `low_marker` | Discharge cutoff % (default 20) |
-| 2 | `u8` | `version` | Dirty/version flag |
-| 3 | `u8` | — | (subscription tag) |
-| 4–7 | — | — | Extended header |
+| 2 | `u8` | `battery_range_override` | 0 = AI-chosen range, â‰ 0 = override mode active |
+| 3 | `u8` | â€” | (subscription tag) |
+| 4â€“7 | â€” | â€” | Extended header |
 | 8 | `u8` | `slot_count` | `0x60`=96 (today only), `0xC0`=192 (today+tomorrow) |
-| 9+ | `u8[]` | `slots` | Per-slot override values (see §8) |
+| 9+ | `u8[]` | `slots` | Per-slot override values (see Â§8) |
 
-### 7.3 Battery Info (`0x06`, ≥80 bytes, request mode `0x10`)
+### 7.3 Battery Info (`0x06`, â‰¥80 bytes, request mode `0x10`)
 
 | Offset | Type | Field | Notes |
 |--------|------|-------|-------|
-| 0–1 | `u16` | `state_flags` | bit0=discharging, bit1=charging, bits2+= faults |
-| 2–3 | `u16` | `bms_temp` | deciKelvin (÷10 − 273.15 = °C) |
-| 4–5 | `u16` | `electrode_a_temp` | deciKelvin |
-| 6–7 | `u16` | `electrode_b_temp` | deciKelvin |
-| 8–9 | `u16` | `voltage_mv` | millivolts |
-| 10–13 | `s32` | `current_ma` | milliamps; negative = discharging |
-| 14–15 | `u16` | `soc` | State of charge % |
-| 16–17 | `u16` | `current_energy_wh` | Current stored energy Wh |
-| 18–19 | `u16` | `full_energy_wh` | Rated capacity Wh |
-| 20–21 | `u16` | `cycle_count` | Charge cycle count |
-| 22–23 | `u16` | `soh` | State of health % |
+| 0â€“1 | `u16` | `state_flags` | bit0=discharging, bit1=charging, bits2+= faults |
+| 2â€“3 | `u16` | `bms_temp` | deciKelvin (Ã·10 âˆ’ 273.15 = Â°C) |
+| 4â€“5 | `u16` | `electrode_a_temp` | deciKelvin |
+| 6â€“7 | `u16` | `electrode_b_temp` | deciKelvin |
+| 8â€“9 | `u16` | `voltage_mv` | millivolts |
+| 10â€“13 | `s32` | `current_ma` | milliamps; negative = discharging |
+| 14â€“15 | `u16` | `soc` | State of charge % |
+| 16â€“17 | `u16` | `current_energy_wh` | Current stored energy Wh |
+| 18â€“19 | `u16` | `full_energy_wh` | Rated capacity Wh |
+| 20â€“21 | `u16` | `cycle_count` | Charge cycle count |
+| 22â€“23 | `u16` | `soh` | State of health % |
 | 24+ | variable | `id_info`, `version`, `barcode` | Length-prefixed strings |
 | + | `u8` | `index` | Cabinet index |
 | + | `u8` | `cabinet_index` | Cabinet index (redundant) |
 | + | `u8` | `cabinet_position` | Position in cabinet |
 | + | `u16` | `capacity` | Capacity Wh |
 
-### 7.4 FCR/mFRR State (`0x45`, 2–4 bytes)
+### 7.4 FCR/mFRR State (`0x45`, 2â€“4 bytes)
 
 | Offset | Type | Field | Notes |
 |--------|------|-------|-------|
-| 0–1 | `u16` | `state` | 0=Idle,1=OnHold,2=FcrN,3=FcrDUp,4=FcrDDown,5=FcrDUpDown,6=MFRRUp,7=MFRRDown |
-| 2–3 | `u16` | `error_flag` | present in 4-byte variant; `≠1` means error |
+| 0â€“1 | `u16` | `state` | 0=Idle,1=OnHold,2=FcrN,3=FcrDUp,4=FcrDDown,5=FcrDUpDown,6=MFRRUp,7=MFRRDown |
+| 2â€“3 | `u16` | `error_flag` | present in 4-byte variant; `â‰ 1` means error |
 
 ### 7.5 Peak Shaving Config (`0x5B`, 20 bytes)
 
@@ -309,17 +378,17 @@ All payloads are little-endian unless noted.
 | 6 | `u8` | `ups_reserve_pct` |
 | 18 | `u8` | `redundancy` |
 
-### 7.6 Peak Schedule (`0x5C`, ≥16 bytes)
+### 7.6 Peak Schedule (`0x5C`, â‰¥16 bytes)
 
 | Offset | Type | Field | Notes |
 |--------|------|-------|-------|
-| 0–1 | `u16` | `schedule_id` | |
+| 0â€“1 | `u16` | `schedule_id` | |
 | 2 | `u8` | `all_day` | 1 = ignore start/end times |
-| 3–6 | `u32` | `start_seconds` | Seconds from midnight |
-| 7–10 | `u32` | `end_seconds` | Seconds from midnight |
+| 3â€“6 | `u32` | `start_seconds` | Seconds from midnight |
+| 7â€“10 | `u32` | `end_seconds` | Seconds from midnight |
 | 11 | `u8` | `repeat_days` | Day-of-week bitmask |
-| 12–13 | `u16` | `min_peak_power_w` | Watts |
-| 16–19 | `u32` | `created_ts` | Unix timestamp (if ≥20B) |
+| 12â€“13 | `u16` | `min_peak_power_w` | Watts |
+| 16â€“19 | `u32` | `created_ts` | Unix timestamp (if â‰¥20B) |
 
 ### 7.7 Manual Selling State (`0x81`, 10 bytes)
 
@@ -327,21 +396,21 @@ All payloads are little-endian unless noted.
 |--------|------|-------|-------|
 | 0 | `u8` | `first_use` | 1 = never used before |
 | 1 | `u8` | `enabled` | 1 = currently selling |
-| 2–5 | `u32` | `target_deci_kwh` | Target in 0.1 kWh units |
-| 6–9 | `u32` | `sold_deci_kwh` | Sold so far in 0.1 kWh units |
+| 2â€“5 | `u32` | `target_deci_kwh` | Target in 0.1 kWh units |
+| 6â€“9 | `u32` | `sold_deci_kwh` | Sold so far in 0.1 kWh units |
 
 ### 7.8 EV Charging Mode (`0x20`, 6 bytes)
 
 | Offset | Type | Field | Notes |
 |--------|------|-------|-------|
-| 0 | `u8` | `mode_minus1` | mode enum − 1; add 1 to get: 1=LowestPrice, 2=SolarOnly, 3=Scheduled, 4=InstantFull, 5=InstantFixed |
-| 1–2 | `u16` | `fixed_kwh` | kWh slider value |
-| 3–4 | `u16` | `fixed_full_kwh` | kWh slider max |
+| 0 | `u8` | `mode_minus1` | mode enum âˆ’ 1; add 1 to get: 1=LowestPrice, 2=SolarOnly, 3=Scheduled, 4=InstantFull, 5=InstantFixed |
+| 1â€“2 | `u16` | `fixed_kwh` | kWh slider value |
+| 3â€“4 | `u16` | `fixed_full_kwh` | kWh slider max |
 | 5 | `u8` | `price_percent` | (semantics unknown) |
 
 ### 7.9 Sell Back to Grid / VPP state (`0x06` mode `0xA0`, 1 byte)
 
-The opcode `0x06` is reused: with mode `0x10` it reads battery info (see §7.3);
+The opcode `0x06` is reused: with mode `0x10` it reads battery info (see Â§7.3);
 with mode `0xA0` it subscribes to the sell-back-to-grid (Virtual Power Plant) state.
 
 | Offset | Type | Field | Notes |
@@ -356,13 +425,13 @@ Response payload for `get_sellingprotection` (opcode `0x5F`, mode `0xA0`).
 |--------|------|-------|-------|
 | 0 | `u8` | `status` | Always 0x00 (firstUse/status byte) |
 | 1 | `u8` | `selling_protection_on` | 1 = export capped/blocked, 0 = allowed |
-| 2–5 | `u32le` | `threshold_kwh` | Daily export cap in kWh/day (0 = no cap) |
+| 2â€“5 | `u32le` | `threshold_kwh` | Daily export cap in kWh/day (0 = no cap) |
 
-The write command (`0x5E`) payload format is **different** — it does **not** include the leading status byte:
+The write command (`0x5E`) payload format is **different** â€” it does **not** include the leading status byte:
 
 ```
 byte 0:   on              (1=enable protection, 0=disable)
-bytes 1–4: threshold_kwh  (LE u32; daily kWh cap; 0 = safe default)
+bytes 1â€“4: threshold_kwh  (LE u32; daily kWh cap; 0 = safe default)
 ```
 
 ---
@@ -370,14 +439,14 @@ bytes 1–4: threshold_kwh  (LE u32; daily kWh cap; 0 = safe default)
 ## 8. Override Slot Values
 
 96 slots per day (15 min per slot). Slots index 0=00:00, 95=23:45.
-192 slots = today (0–95) + tomorrow (96–191).
+192 slots = today (0â€“95) + tomorrow (96â€“191).
 
 | Value | Meaning |
 |-------|---------|
-| `0x80` (128) | No override — follow smart schedule |
-| `0x00` (0) | Idle — neither charge nor discharge |
-| 1–100 | Charge when SoC < N% |
-| 129–255 | Discharge when SoC > (256 − N)% |
+| `0x80` (128) | No override â€” follow smart schedule |
+| `0x00` (0) | Idle â€” neither charge nor discharge |
+| 1â€“100 | Charge when SoC < N% |
+| 129â€“255 | Discharge when SoC > (256 âˆ’ N)% |
 
 Constants in `const.py`:
 - `SLOT_NO_OVERRIDE = 0x80`
@@ -392,19 +461,19 @@ Constants in `const.py`:
 ### `0x22` SET_EV_CHARGING_MODE (Smart modes, 9 bytes)
 
 ```
-byte 0:   mode − 1        (0=LowestPrice, 1=SolarOnly, 2=Scheduled)
+byte 0:   mode âˆ’ 1        (0=LowestPrice, 1=SolarOnly, 2=Scheduled)
 byte 1:   no_schedule     (1 if no hour bitmaps, 0 if bitmaps supplied)
-bytes 2–4: weekday bitmap  (24-bit, LSB=hour 0, packed 8h/byte)
-bytes 5–7: weekend bitmap  (same format)
+bytes 2â€“4: weekday bitmap  (24-bit, LSB=hour 0, packed 8h/byte)
+bytes 5â€“7: weekend bitmap  (same format)
 byte 8:   sync            (1 = sync to other home devices)
 ```
 
 ### `0x31` SET_EVCHARGINGMODE_INSTANT (Instant modes, 4 bytes)
 
 ```
-byte 0:   mode − 1        (3=InstantFull, 4=InstantFixed)
+byte 0:   mode âˆ’ 1        (3=InstantFull, 4=InstantFixed)
 byte 1:   consume_flag    (0 if mode==InstantFixed, else 1)
-bytes 2–3: fixed_kwh      (LE u16; 0 for InstantFull)
+bytes 2â€“3: fixed_kwh      (LE u16; 0 for InstantFull)
 ```
 
 ### `0x29` SET_EVCHARGINGMODE_INSTANTCHARGE (toggle, 1 byte)
@@ -421,17 +490,18 @@ byte 0:   instant_on      (1=enable Instant, 0=return to Smart)
 
 ```
 byte 0:   on              (1=enable, 0=disable)
-bytes 1–4: start_unix     (LE u32; unix timestamp)
-bytes 5–8: end_unix       (LE u32; unix timestamp)
+bytes 1â€“4: start_unix     (LE u32; unix timestamp)
+bytes 5â€“8: end_unix       (LE u32; unix timestamp)
 9 zero bytes = cancel
 ```
-Default window when enabling: now → top-of-current-hour + 48h.
+Default window when enabling: now â†’ now + 1h (coordinator fallback) or
+top-of-current-hour + 48h (standalone firmware default).
 
 ### `0x80` set_manual_selling (6 bytes)
 
 ```
 byte 0:   on              (1=enable, 0=disable)
-bytes 1–4: target_kwh     (LE u32; integer kWh)
+bytes 1â€“4: target_kwh     (LE u32; integer kWh)
 byte 5:   expand          (1=expand selling, 0=no)
 ```
 
@@ -456,7 +526,7 @@ This is a fire-and-forget command; the device does **not** send a response paylo
 
 ```
 byte 0:    on             (1=enable cap, 0=disable cap)
-bytes 1–4: threshold_kwh  (LE u32; daily export cap in kWh/day; 0 = safe default)
+bytes 1â€“4: threshold_kwh  (LE u32; daily export cap in kWh/day; 0 = safe default)
 ```
 
 ---
@@ -465,10 +535,10 @@ bytes 1–4: threshold_kwh  (LE u32; daily export cap in kWh/day; 0 = safe defau
 
 | Size | Meaning |
 |------|---------|
-| 212B | `CONN_NOT_ESTABLISHED` — stale credentials or device offline |
-| 166B | Relay routing echo — command forwarded but device not yet connected |
+| 212B | `CONN_NOT_ESTABLISHED` â€” stale credentials or device offline |
+| 166B | Relay routing echo â€” command forwarded but device not yet connected |
 | 161B | Normal ACK for write commands |
-| 146B | `MEMBER_EXSPIRED` — credentials expired |
+| 146B | `MEMBER_EXSPIRED` â€” credentials expired |
 
 The relay always responds (even to commands it forwarded); the actual device response (if any) arrives as a separate UDP packet.
 
@@ -482,12 +552,12 @@ Base URL: `https://api.emaldo.com` (some data endpoints on `https://dp.emaldo.co
 
 ```
 POST /user/login/
-Body (form-encoded): json=<encrypt_field({"username":…,"password":…})>, gm=1
-Response: {"Status":1, "Result":{"token":…, "user_id":…}}
+Body (form-encoded): json=<encrypt_field({"username":â€¦,"password":â€¦})>, gm=1
+Response: {"Status":1, "Result":{"token":â€¦, "user_id":â€¦}}
 ```
 
 Token is stored locally and passed in subsequent requests as `token=<encrypt_field(token + timestamp)>`.
-Auth status `-12` → session expired → re-login required.
+Auth status `-12` â†’ session expired â†’ re-login required.
 
 ### Key Endpoints
 
@@ -511,7 +581,7 @@ Auth status `-12` → session expired → re-login required.
 | `/domain/getappversionstate/` | App version info |
 
 All JSON bodies sent as `json=<encrypt_field(json_string)>` + `token=<encrypt_field(token+ts)>` + `gm=1`.
-Responses contain `{"Status": int, "Result": …}`. `Result` is RC4+Snappy encrypted when it is a string.
+Responses contain `{"Status": int, "Result": â€¦}`. `Result` is RC4+Snappy encrypted when it is a string.
 
 ---
 
@@ -528,12 +598,12 @@ Hardcoded in APK, extracted via `emaldo/extract_keys.py`:
 
 ## 14. Implementation Notes
 
-- **Credential freshness**: Always call `e2e_login()` fresh; never re-use cached E2E credentials from a previous session. The relay validates credentials and returns 212B if they are stale.
-- **Command timing**: Wait ≥200ms after heartbeat before sending commands, or the relay may reject them.
-- **Fire-and-forget**: Commands like `0x41` (third-party PV), `0x05` (sell-back-to-grid), and `0x5E` (sell limit) have `setIsNeedResult=false` in the APK — they send no application-level response payload. Only a relay ACK (~161B) is returned.
-- **State lag**: After a write command, wait ≥1–2s before reading back state via a subscribe command — the device takes time to apply changes.
+- **Credential freshness**: Per-device `e2e_login()` results are cached for **10 minutes** and reused across reads/reconnects (the relay validates credentials and returns 21204/`CONN_NOT_ESTABLISHED` if they are genuinely stale). A 21204 triggers an in-place re-handshake with current creds first; cloud credential refresh (`force_refresh`) only happens if that fails. Account-level `/home/e2e-login/` is cached 30 minutes with a per-home serialization lock so concurrent multi-device refreshes don't ping-pong-rotate the shared home secret (#47).
+- **Command timing**: Wait â‰¥200ms after heartbeat before sending commands, or the relay may reject them.
+- **Fire-and-forget**: Commands like `0x41` (third-party PV), `0x05` (sell-back-to-grid), and `0x5E` (sell limit) have `setIsNeedResult=false` in the APK â€” they send no application-level response payload. Only a relay ACK (~161B) is returned.
+- **State lag**: After a write command, wait â‰¥1â€“2s before reading back state via a subscribe command â€” the device takes time to apply changes.
 - **Multiple responses**: Subscribe commands (`0xA0` mode) may return multiple UDP packets. The first is often a relay echo/ACK; the actual data arrives in a subsequent packet.
-- **Battery probing**: Send one `0x06` request per *physical* slot index. Slots are addressed by their position in the cabinet (a module in the third slot answers at index 2; empty lower slots stay silent), so probing walks fixed index tiers (e.g. 0–2, 3–7, 8–12) to also cover a second cabinet whose modules start at a higher base index. Stop probing a tier after two consecutive short (<250B) or missing responses, but continue into the next tier rather than aborting the whole scan. A short per-probe timeout (≈1.5 s, vs. the full handshake timeout) keeps empty slots cheap.
+- **Battery probing**: Send one `0x06` request per *physical* slot index. Slots are addressed by their position in the cabinet (a module in the third slot answers at index 2; empty lower slots stay silent), so probing walks fixed index tiers (e.g. 0â€“2, 3â€“7, 8â€“12) to also cover a second cabinet whose modules start at a higher base index. Stop probing a tier after two consecutive short (<250B) or missing responses, but continue into the next tier rather than aborting the whole scan. A short per-probe timeout (â‰ˆ1.5 s, vs. the full handshake timeout) keeps empty slots cheap.
 
 ---
 

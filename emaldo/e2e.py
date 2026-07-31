@@ -58,6 +58,14 @@ _pf_rejected_count = 0
 _pf_rejected_window_start = 0.0
 _pf_rejected_window_s = 60.0
 
+# Coalescing for the benign `parse_battery_data: payload is None` line. Empty
+# battery module slots (idx 3-12 when modules not installed) hit this on every
+# poll; ~15x/min would otherwise flood. First event immediate, then 1 line/window.
+_battery_none_lock = threading.Lock()
+_battery_none_count = 0
+_battery_none_window_start = 0.0
+_battery_none_window_s = 60.0
+
 # Cumulative count of power-flow packets dropped by _has_reasonable_power_flow_values.
 _power_flow_sanity_drops: int = 0
 
@@ -366,24 +374,79 @@ def _is_override_payload(payload: bytes) -> bool:
     return payload[8] in (0x60, 0xC0)
 
 
-def _classify_decrypted_payload(payload_hex: str) -> str:
-    """Classify a decrypted-but-non-power-flow payload for diagnostics.
+# Markers found in real relay control datagrams (verified beta16k/16l, #53 log):
+# the raw response carries plaintext presence/control tags outside the AES-CBC
+# body, so decrypt_response cannot parse them — they are NOT power-flow and NOT
+# errors, just the relay's keepalive/notice/server traffic multiplexed onto the
+# same subscription socket. ``alive``/``and_`` = keepalive ACK; ``notice``/``srv``
+# = relay notice/server-status frame; ``SERVER`` = relay control frame.
+_KEEPALIVE_MARKERS = (b"alive", b"and_", b"notice", b"srv", b"SERVER")
 
-    The relay delivers status/control JSON (e.g. ``{"__time":...,"domain":...}``
-    or ``cmd not allowed``) on the same socket as power-flow frames. These
-    decrypt cleanly but are not power-flow/battery data — they are *handled*
-    (decrypted + identified) and ignored, not *rejected* as errors. Returning a
-    human-readable label keeps the debug log honest about what happened.
+
+def _classify_drain_payload(
+    resp: bytes, decrypted: bytes | None
+) -> tuple[str, str]:
+    """Classify a drain datagram into a (category_key, display) pair.
+
+    The relay multiplexes several datagram kinds onto the same persistent E2E
+    subscription socket as the 0x30 power-flow frames. Anything that is not a
+    recognized data frame (power-flow, regulate-frequency, force-logout) lands
+    in the drain "unparsed" bucket. These are almost all NORMAL relay traffic
+    (keepalive ACKs, status/control pushes), not errors — the high unparsed
+    ratio only means most pushes on this socket are control, not power-flow.
+
+    Classification uses the RAW response first (the keepalive tags live outside
+    the encrypted body), then the decrypted payload.
+
+    Categories (``category_key``):
+      - ``keepalive_ack``— raw response carries a relay presence/control tag
+                           (``alive``/``and_``/``notice``/``srv``/``SERVER``).
+                           Normal relay keepalive/notice/server traffic. By far
+                           the most common; not decryptable as data with our key.
+      - ``status_json``  — decrypted, valid UTF-8 JSON object/array
+                           (e.g. ``{"__time":...,"domain":...}``). Status push.
+      - ``control_text`` — decrypted, printable text but not JSON
+                           (e.g. ``cmd not allowed``, ACK strings).
+      - ``binary``       — decrypted (often a partial/tail block) but not valid
+                           printable text.
+      - ``undecryptable``— neither a relay-control tag nor decryptable with any
+                           known key. The ONLY category that may indicate a real
+                           problem (stale secret / wrong key / corrupt frame).
+
+    ``decrypted`` is the recovered payload bytes, or ``None`` when every decrypt
+    attempt failed.
+    """
+    if resp and any(m in resp for m in _KEEPALIVE_MARKERS):
+        return "keepalive_ack", f"keepalive_ack (relay presence, resp {len(resp)}B)"
+    if not decrypted:
+        return "undecryptable", "undecryptable (no key decrypted it)"
+    try:
+        text = decrypted.decode("utf-8")
+    except UnicodeDecodeError:
+        return "binary", f"binary {len(decrypted)}B (not power-flow/battery)"
+    printable = all(32 <= b < 127 or b in (9, 10, 13) for b in decrypted)
+    if not printable:
+        return "binary", f"binary {len(decrypted)}B (not power-flow/battery)"
+    stripped = text.strip()
+    preview = text if len(text) <= 48 else text[:45] + "..."
+    if stripped[:1] in ("{", "["):
+        return "status_json", f"status_json: {preview!r}"
+    return "control_text", f"control_text: {preview!r}"
+
+
+def _classify_decrypted_payload(payload_hex: str) -> str:
+    """Backward-compatible display-string classifier (coalesced summary).
+
+    Wraps :func:`_classify_drain_payload`; returns only the human-readable
+    display half so the existing ``DECRYPTED non-data push`` summary line is
+    unchanged in shape. This path only has the decrypted payload (no raw
+    response), so the keepalive detection does not apply here.
     """
     try:
         raw = bytes.fromhex(payload_hex)
-        text = raw.decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
+    except ValueError:
         return "binary (not power-flow/battery)"
-    if all(32 <= b < 127 or b in (9, 10, 13) for b in text.encode("utf-8")):
-        preview = text if len(text) <= 48 else text[:45] + "..."
-        return f"text/status push: {preview!r}"
-    return "binary (not power-flow/battery)"
+    return _classify_drain_payload(b"", raw)[1]
 
 
 def decrypt_response(
@@ -393,6 +456,7 @@ def decrypt_response(
     accepted_headers: set[tuple[int, int]] | None = None,
     payload_validator: Callable[[bytes], bool] | None = None,
     fallback_ivs: list[bytes] | None = None,
+    silent: bool = False,
 ) -> bytes | None:
     """Decrypt the encrypted payload from an E2E response packet.
 
@@ -437,7 +501,7 @@ def decrypt_response(
             idx = pos + 1
 
     if not nonces:
-        if _LOGGER.isEnabledFor(logging.DEBUG):
+        if not silent and _LOGGER.isEnabledFor(logging.DEBUG):
             _LOGGER.debug(
                 "decrypt_response: no nonce markers (90a3/10a3) found "
                 "in %d-byte response, hex=%s",
@@ -527,7 +591,7 @@ def decrypt_response(
             except (ValueError, KeyError):
                 continue
 
-    if _LOGGER.isEnabledFor(logging.DEBUG) and nonces:
+    if not silent and _LOGGER.isEnabledFor(logging.DEBUG) and nonces:
         def _positions(marker: bytes) -> list[int]:
             out = []
             idx = 0
@@ -636,7 +700,29 @@ def parse_battery_data(payload: bytes) -> dict | None:
         Dict with decoded fields, or *None* if payload is invalid.
     """
     if payload is None:
-        _LOGGER.debug("parse_battery_data: payload is None")
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            global _battery_none_count, _battery_none_window_start
+            with _battery_none_lock:
+                _battery_none_count += 1
+                now = time.monotonic()
+                if _battery_none_window_start == 0.0:
+                    n = _battery_none_count
+                    _battery_none_count = 0
+                    _battery_none_window_start = now
+                    _flush = True
+                elif now - _battery_none_window_start >= _battery_none_window_s:
+                    n = _battery_none_count
+                    _battery_none_count = 0
+                    _battery_none_window_start = now
+                    _flush = True
+                else:
+                    n = None
+                    _flush = False
+            if _flush:
+                _LOGGER.debug(
+                    "parse_battery_data: payload is None%s",
+                    f" [x{n} in window]" if n else "",
+                )
         return None
     if len(payload) < 26:
         _LOGGER.debug("parse_battery_data: payload too short (%d bytes)", len(payload))
@@ -1020,6 +1106,9 @@ def read_overrides(
         decrypted = decrypt_response(
             resp, e2e_creds["chat_secret"],
             payload_validator=_is_override_payload,
+            # Benign relay frames are not override payloads; silence the
+            # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
         )
         state = parse_override_state(decrypted)
         if state is not None:
@@ -1032,6 +1121,9 @@ def read_overrides(
                 decrypted = decrypt_response(
                     resp, e2e_creds["chat_secret"],
                     payload_validator=_is_override_payload,
+                    # Benign relay frames are not override payloads; silence the
+                    # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                    silent=True,
                 )
                 state = parse_override_state(decrypted)
                 if state is not None:
@@ -1122,6 +1214,9 @@ def read_battery_info(
         decrypted = decrypt_response(
             resp, e2e_creds["chat_secret"],
             accepted_headers={HEADER_BATTERY},
+            # Benign relay frames are not battery payloads; silence the
+            # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
         )
         return parse_battery_data(decrypted)
 
@@ -1433,6 +1528,9 @@ def read_regulate_frequency_state(
         decrypted = decrypt_response(
             resp, e2e_creds["chat_secret"],
             payload_validator=_is_regulate_frequency_payload,
+            # Benign relay frames are not reg-freq payloads; silence the
+            # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
         )
         result = parse_regulate_frequency_state(decrypted)
         if result is not None:
@@ -1445,6 +1543,9 @@ def read_regulate_frequency_state(
                 decrypted = decrypt_response(
                     resp, e2e_creds["chat_secret"],
                     payload_validator=_is_regulate_frequency_payload,
+                    # Benign relay frames are not reg-freq payloads; silence the
+                    # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                    silent=True,
                 )
                 result = parse_regulate_frequency_state(decrypted)
                 if result is not None:
@@ -1529,6 +1630,9 @@ def read_power_flow(
             resp, e2e_creds["chat_secret"],
             payload_validator=_is_power_flow_payload,
             fallback_ivs=[session_nonce.encode()],
+            # Benign relay frames are not power-flow payloads; silence the
+            # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
         )
         if decrypted is None:
             # Fallback: home-level chat_secret (#47 beta15h)
@@ -1540,6 +1644,9 @@ def read_power_flow(
                     resp, home_secret,
                     payload_validator=_is_power_flow_payload,
                     fallback_ivs=[session_nonce.encode()],
+                    # Benign relay frames are not power-flow payloads; silence the
+                    # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                    silent=True,
                 )
         if decrypted is not None and log:
             _log_power_flow_raw(decrypted, log)
@@ -1568,6 +1675,9 @@ def read_power_flow(
                     resp, e2e_creds["chat_secret"],
                     payload_validator=_is_power_flow_payload,
                     fallback_ivs=[session_nonce.encode()],
+                    # Benign relay frames are not power-flow payloads; silence the
+                    # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                    silent=True,
                 )
                 if decrypted is None:
                     home_secret = e2e_creds.get("home_chat_secret", "")
@@ -1576,6 +1686,9 @@ def read_power_flow(
                             resp, home_secret,
                             payload_validator=_is_power_flow_payload,
                             fallback_ivs=[session_nonce.encode()],
+                            # Benign relay frames are not power-flow payloads;
+                            # silence the per-call decrypt failure flood (#47 beta16m).
+                            silent=True,
                         )
                 if decrypted is not None and log:
                     _log_power_flow_raw(decrypted, log)
@@ -2092,6 +2205,9 @@ def get_manual_selling(
         decrypted = decrypt_response(
             resp, e2e_creds["chat_secret"],
             payload_validator=lambda b: len(b) >= 10,
+            # Benign relay frames are not manual-selling payloads; silence the
+            # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
         )
         return parse_manual_selling_response(decrypted)
     finally:
@@ -2239,7 +2355,13 @@ def read_peak_shaving(
     for label, resp in results:
         if resp is None:
             continue
-        dec = decrypt_response(resp, chat_secret, payload_validator=_accept_any)
+        dec = decrypt_response(
+            resp, chat_secret,
+            payload_validator=_accept_any,
+            # Benign relay frames are not peak-shaving payloads; silence the
+            # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
+        )
         if dec is None:
             continue
         if "config" in label.lower() and len(dec) >= 20:
@@ -2663,6 +2785,9 @@ def read_ev_charging_mode(
         # Permissive validator: any 6-byte payload is acceptable here
         # because the response has no distinctive 2-byte header.
         payload_validator=lambda p: len(p) == 6,
+        # Benign relay frames are not EV payloads; silence the per-call
+        # decrypt failure flood (#47 decrypt-noise, beta16m).
+        silent=True,
     )
     return parse_ev_charging_info(decrypted)
 
@@ -2920,7 +3045,12 @@ def get_selling_protection(
     def _try_decrypt_verbose(resp: bytes, label: str) -> bytes | None:
         """Decrypt without validator (for debug), log raw payload."""
         try:
-            raw = decrypt_response(resp, e2e_creds["chat_secret"])
+            raw = decrypt_response(
+                resp, e2e_creds["chat_secret"],
+                # Benign relay frames are not the expected payload; silence the
+                # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                silent=True,
+            )
             if log and raw is not None:
                 b0 = f"0x{raw[0]:02x}" if raw else "N/A"
                 log(f"  {label} raw decrypted ({len(raw)}B): {raw.hex()} | byte[0]={b0}")
@@ -2943,6 +3073,9 @@ def get_selling_protection(
         decrypted = decrypt_response(
             resp, e2e_creds["chat_secret"],
             payload_validator=_is_selling_protection_payload,
+            # Benign relay frames are not selling-protection payloads; silence
+            # the per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
         )
         result = parse_selling_protection_response(decrypted)
         if result is not None:
@@ -2957,6 +3090,9 @@ def get_selling_protection(
                 decrypted = decrypt_response(
                     resp, e2e_creds["chat_secret"],
                     payload_validator=_is_selling_protection_payload,
+                    # Benign relay frames are not selling-protection payloads;
+                    # silence the per-call decrypt failure flood (#47 beta16m).
+                    silent=True,
                 )
                 result = parse_selling_protection_response(decrypted)
                 if result is not None:
@@ -3066,7 +3202,12 @@ def get_virtualpowerplant(
 
     def _try_decrypt_verbose(resp: bytes, label: str) -> bytes | None:
         try:
-            raw = decrypt_response(resp, e2e_creds["chat_secret"])
+            raw = decrypt_response(
+                resp, e2e_creds["chat_secret"],
+                # Benign relay frames are not the expected payload; silence the
+                # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                silent=True,
+            )
             if log and raw is not None:
                 b0 = f"0x{raw[0]:02x}" if raw else "N/A"
                 log(f"  {label} raw decrypted ({len(raw)}B): {raw.hex()} | byte[0]={b0}")
@@ -3089,6 +3230,9 @@ def get_virtualpowerplant(
         decrypted = decrypt_response(
             resp, e2e_creds["chat_secret"],
             payload_validator=_is_virtualpowerplant_payload,
+            # Benign relay frames are not VPP payloads; silence the per-call
+            # decrypt failure flood (#47 decrypt-noise, beta16m).
+            silent=True,
         )
         result = parse_virtualpowerplant_response(decrypted)
         if result is not None:
@@ -3103,6 +3247,9 @@ def get_virtualpowerplant(
                 decrypted = decrypt_response(
                     resp, e2e_creds["chat_secret"],
                     payload_validator=_is_virtualpowerplant_payload,
+                    # Benign relay frames are not VPP payloads; silence the
+                    # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                    silent=True,
                 )
                 result = parse_virtualpowerplant_response(decrypted)
                 if result is not None:
@@ -3313,7 +3460,37 @@ class PersistentE2ESession:
         self._stream_reconnect_reasons: dict[str, int] = {}
         self._stream_last_reconnect_reason: str | None = None
         self._stream_drain_packets = 0
+        # Drained non-power-flow datagrams split into three scopes (beta16k):
+        #
+        #   1. keepalive_ack  -> _stream_keepalive_acks (top-level counter)
+        #      Benign relay presence/keepalive/notice/server chatter
+        #      (alive/and_/notice/srv/SERVER). By far the most common; NOT a
+        #      problem and NOT "unparsed" — it just isn't power-flow.
+        #
+        #   2. status_json / control_text -> _stream_relay_status (dict)
+        #      Decrypted, readable relay status pushes / ACKs. Also benign;
+        #      broken out separately so they don't inflate the concern counter.
+        #
+        #   3. binary / undecryptable -> _stream_drain_unparsed (+ categories)
+        #      Frames we genuinely could not parse into readable data. THIS is
+        #      the counter worth watching (undecryptable = stale secret / wrong
+        #      key / corrupt frame; binary = partial/unknown blob).
+        self._stream_keepalive_acks = 0
+        self._stream_relay_status: dict[str, int] = {
+            "status_json": 0,
+            "control_text": 0,
+        }
         self._stream_drain_unparsed = 0
+        self._stream_drain_unparsed_categories: dict[str, int] = {
+            "binary": 0,
+            "undecryptable": 0,
+        }
+        # One-shot rate-limited sample of each category's payload for
+        # verification (beta16k). Emitted at DEBUG at most once per category per
+        # _stream_drain_sample_window seconds so a debug-log test run reveals the
+        # actual payloads without flooding.
+        self._stream_drain_sample_last: dict[str, float] = {}
+        self._stream_drain_sample_window = 120.0
         # Decrypt-gated reconnect success (#53 Q1/Q3). A handshake returning
         # "ok" only proves the transport reconnected — it does NOT prove the
         # current chat_secret can still decrypt the realtime push stream. We
@@ -3846,10 +4023,23 @@ class PersistentE2ESession:
         The reason counters are exposed via the diagnostic sensor so a reconnect
         storm can be diagnosed from attributes alone (no debug logging needed).
 
-        Only force-refresh E2E credentials when the reconnect is caused by a
-        21204 (session expired).  Other reasons (long_stall, socket errors) do
-        NOT rotate chat_secret, breaking the death spiral where every reconnect
-        creates undecryptable pending packets (#47 beta15f).
+        Force-refresh E2E credentials when the reconnect is caused by a 21204
+        (session expired).  Other reasons (socket errors) do NOT rotate
+        chat_secret, breaking the death spiral where every reconnect creates
+        undecryptable pending packets (#47 beta15f).
+
+        A ``long_stall`` is special: it means the relay stopped pushing frames
+        for the whole stall window and in-place re-handshakes did not recover
+        (observed: keepalive_acks frozen, relay_status all-zero — a relay-side
+        session-binding drop, NOT a decrypt failure). Re-handshaking with the
+        same creds "succeeds" at transport level but the relay never resumes
+        pushing, so the in-place reconnect spins (~20×) until the coordinator's
+        120s wedge timer force-resets REST.  If the session was previously
+        healthy (``_stream_ever_decrypted``), rotate the home secret on the
+        stall (same path as 21204) so the in-place reconnect self-heals instead
+        of waiting for the full REST rebuild (#47 long_stall wedge, beta16n).
+        Cold-start stalls (never decrypted) are left alone — a legitimately idle
+        relay must not be punished by a forced rotation.
         """
         # Always record the latest reason so the diagnostic sensor reflects the
         # most recent trigger. The per-rebuild reason count is incremented in
@@ -3858,6 +4048,10 @@ class PersistentE2ESession:
         # reconnect retries while the flag is already set (#47 beta16h-C4).
         self._stream_last_reconnect_reason = reason
         if "21204" in reason:
+            self._stream_needs_creds_refresh = True
+        elif "long_stall" in reason and self._stream_ever_decrypted:
+            # Relay dropped the session binding; rotate home secret so the
+            # in-place reconnect re-establishes a fresh session (#47 beta16n).
             self._stream_needs_creds_refresh = True
         self._stream_needs_reconnect = True
 
@@ -3869,7 +4063,12 @@ class PersistentE2ESession:
                 "resubscribes": self._stream_resubscribes,
                 "reconnects": self._stream_reconnects,
                 "drain_packets": self._stream_drain_packets,
+                "keepalive_acks": self._stream_keepalive_acks,
+                "relay_status": dict(self._stream_relay_status),
                 "drain_unparsed": self._stream_drain_unparsed,
+                "drain_unparsed_categories": dict(
+                    self._stream_drain_unparsed_categories
+                ),
                 "last_reconnect_reason": self._stream_last_reconnect_reason,
                 "reconnect_reasons": dict(self._stream_reconnect_reasons),
                 "creds_refresh_queued": self._stream_needs_creds_refresh,
@@ -4042,12 +4241,20 @@ class PersistentE2ESession:
                     break
 
                 # 1) Try own chat_secret first (fast path — most packets)
-                pf = self._try_parse_power_flow(resp)
+                #    Skip non-0x30 datagrams (relay keepalive/notice/other
+                #    command replies) before decrypting — they are not
+                #    power-flow frames and only trigger the reasonability
+                #    sanity log when force-fed to the parser.
+                pf = (
+                    self._try_parse_power_flow(resp)
+                    if self._is_0x30_reply(resp)
+                    else None
+                )
                 dev_id = own_device_id
                 alt_hit = False
 
                 # 2) Alt-key loop: try every other device's secret (#47 beta15f)
-                if pf is None and alt_keys:
+                if pf is None and alt_keys and self._is_0x30_reply(resp):
                     for alt_dev_id, alt_secret in alt_keys.items():
                         if alt_secret == self._creds.get("chat_secret"):
                             continue  # already tried via own-creds path
@@ -4094,6 +4301,12 @@ class PersistentE2ESession:
                             payload_validator=lambda d: (
                                 b"logout" in d
                             ),
+                            # Benign relay frames (keepalive/notice) are not
+                            # logout JSON, so this decrypt "fails" on nearly
+                            # every drain packet. Silence the per-call flood;
+                            # a real logout is still surfaced by the SUCCESS
+                            # log below (#47 decrypt-noise, beta16m follow-up).
+                            silent=True,
                         )
                         if decoded is not None:
                             text = decoded.decode("utf-8", errors="replace")
@@ -4107,9 +4320,68 @@ class PersistentE2ESession:
                     except Exception:
                         pass
 
-                # A datagram we received but could not classify — track it so a
-                # "frames=0 but packets>0" situation is visible in diagnostics.
-                self._stream_drain_unparsed += 1
+                # A datagram we received but that is not a data frame. Classify
+                # it (beta16k) and route it into the right scope so diagnostics
+                # separate benign relay chatter from frames we truly could not
+                # parse. Try a permissive decrypt with the known keys purely to
+                # recover the plaintext for classification; if nothing decrypts
+                # it (and it carries no relay-control tag) it is undecryptable.
+                _decoded_for_class: bytes | None = None
+                _class_keys = [self._creds.get("chat_secret", "")]
+                _hs = self._creds.get("home_end_secret", "")
+                if _hs:
+                    _class_keys.append(_hs)
+                for _k in alt_keys.values() if alt_keys else []:
+                    if _k and _k not in _class_keys:
+                        _class_keys.append(_k)
+                for _k in _class_keys:
+                    if not _k:
+                        continue
+                    try:
+                        _decoded_for_class = decrypt_response(
+                            resp, _k, payload_validator=lambda _d: True,
+                            silent=True,
+                        )
+                    except Exception:  # noqa: BLE001 - classification best-effort
+                        _decoded_for_class = None
+                    if _decoded_for_class is not None:
+                        break
+                _cat, _display = _classify_drain_payload(
+                    resp, _decoded_for_class
+                )
+                # Route by scope:
+                #   keepalive_ack          -> benign top-level counter
+                #   status_json/control_text -> benign relay-status dict
+                #   binary/undecryptable   -> genuinely-unparsed (+ categories)
+                if _cat == "keepalive_ack":
+                    self._stream_keepalive_acks += 1
+                elif _cat in self._stream_relay_status:
+                    self._stream_relay_status[_cat] += 1
+                else:
+                    self._stream_drain_unparsed += 1
+                    self._stream_drain_unparsed_categories[_cat] = (
+                        self._stream_drain_unparsed_categories.get(_cat, 0) + 1
+                    )
+                # Rate-limited per-category sample so a debug-log test run
+                # reveals the real payloads (verification aid, beta16k). At most
+                # one sample per category per _stream_drain_sample_window seconds.
+                if _LOGGER.isEnabledFor(logging.DEBUG):
+                    _now_s = time.perf_counter()
+                    _last_s = self._stream_drain_sample_last.get(_cat, 0.0)
+                    if _now_s - _last_s >= self._stream_drain_sample_window:
+                        self._stream_drain_sample_last[_cat] = _now_s
+                        _hexlen = 0 if _decoded_for_class is None else len(_decoded_for_class)
+                        _rawhex = _decoded_for_class.hex() if _decoded_for_class is not None else ""
+                        _resp_ascii = "".join(
+                            chr(_b) if 32 <= _b < 127 else "." for _b in resp[:48]
+                        )
+                        _LOGGER.debug(
+                            "[E2E] drain unparsed sample: category=%s payload=%dB "
+                            "%s | resp_len=%dB resp_ascii=%r resp_head=%s "
+                            "decrypted_hex=%s",
+                            _cat, _hexlen, _display,
+                            len(resp), _resp_ascii, resp[:32].hex(), _rawhex[:256],
+                        )
         finally:
             try:
                 self._sock.settimeout(prev_timeout)
@@ -4329,6 +4601,11 @@ class PersistentE2ESession:
             decrypted = decrypt_response(
                 resp, key,
                 payload_validator=_is_regulate_frequency_payload,
+                # Benign relay frames (keepalive/notice) are not regulate-freq
+                # payloads, so this decrypt "fails" on nearly every drain
+                # packet. Silence the per-call flood; a real reg-freq frame is
+                # still returned and cached (#47 decrypt-noise, beta16m).
+                silent=True,
             )
         except Exception:  # noqa: BLE001 - best-effort parse
             return None
@@ -4347,6 +4624,7 @@ class PersistentE2ESession:
                 resp, key,
                 payload_validator=_is_power_flow_payload,
                 fallback_ivs=[self._session_nonce.encode()],
+                silent=True,
             )
         except Exception as exc:  # noqa: BLE001 - best-effort parse
             if self._log:
@@ -4368,6 +4646,7 @@ class PersistentE2ESession:
                         resp, home_secret,
                         payload_validator=_is_power_flow_payload,
                         fallback_ivs=[self._session_nonce.encode()],
+                        silent=True,
                     )
                 except Exception:  # noqa: BLE001 - best-effort parse
                     pass
@@ -4475,6 +4754,7 @@ class PersistentE2ESession:
                 decrypted = decrypt_response(
                     resp, self._creds["chat_secret"],
                     payload_validator=_is_selling_protection_payload,
+                    silent=True,
                 )
             except Exception:  # noqa: BLE001
                 decrypted = None
@@ -4494,6 +4774,7 @@ class PersistentE2ESession:
                     decrypted = decrypt_response(
                         more_resp, self._creds["chat_secret"],
                         payload_validator=_is_selling_protection_payload,
+                        silent=True,
                     )
                 except Exception:  # noqa: BLE001
                     continue
@@ -4527,6 +4808,7 @@ class PersistentE2ESession:
                 decrypted = decrypt_response(
                     resp, self._creds["chat_secret"],
                     payload_validator=_is_virtualpowerplant_payload,
+                    silent=True,
                 )
             except Exception:  # noqa: BLE001
                 decrypted = None
@@ -4546,6 +4828,7 @@ class PersistentE2ESession:
                     decrypted = decrypt_response(
                         more_resp, self._creds["chat_secret"],
                         payload_validator=_is_virtualpowerplant_payload,
+                        silent=True,
                     )
                 except Exception:  # noqa: BLE001
                     continue
@@ -4580,6 +4863,7 @@ class PersistentE2ESession:
                 decrypted = decrypt_response(
                     resp, self._creds["chat_secret"],
                     payload_validator=lambda b: len(b) >= 10,
+                    silent=True,
                 )
             except Exception:  # noqa: BLE001
                 decrypted = None
@@ -4599,6 +4883,7 @@ class PersistentE2ESession:
                     decrypted = decrypt_response(
                         more_resp, self._creds["chat_secret"],
                         payload_validator=lambda b: len(b) >= 10,
+                        silent=True,
                     )
                 except Exception:  # noqa: BLE001
                     continue
@@ -4750,6 +5035,9 @@ class PersistentE2ESession:
             decrypted = decrypt_response(
                 resp, self._creds["chat_secret"],
                 accepted_headers={HEADER_BATTERY},
+                # Benign relay frames are not battery payloads; silence the
+                # per-call decrypt failure flood (#47 decrypt-noise, beta16m).
+                silent=True,
             )
         except Exception:  # noqa: BLE001 - best-effort parse
             return None
@@ -4896,6 +5184,31 @@ class PersistentE2ESession:
             return "n/a"
         return f"{(now_ts - event_ts) * 1000.0:.1f}ms"
 
+
+    # METHOD field marker for a 0x30 (GET_GLOBAL_CURRENT_FLOW_INFO) reply.
+    # The relay echoes the command type in the outer packet as the TLV
+    # ``82 f5 <msg_type> <mode>`` sequence. A power-flow reply carries
+    # ``82 f5 30``; keepalive/notice/wake/heartbeat datagrams on the same
+    # shared subscription socket carry other method bytes (or the literal
+    # "alive"/"heartbeat" strings) and must NOT be fed to the power-flow
+    # parser. This pre-filter stops the heuristic mis-routing that produced
+    # the "PowerFlow reasonability fail" DEBUG floods (see #investigation).
+    _POWER_FLOW_METHOD_MARKER = b"\x82\xf5\x30"
+
+    @classmethod
+    def _is_0x30_reply(cls, resp: bytes) -> bool:
+        """Return True if *resp* is plausibly a 0x30 power-flow reply.
+
+        Cheap pre-decode check on the raw outer packet: the relay's METHOD
+        TLV (``82 f5 <msg_type> <mode>``) must advertise type 0x30. Datagrams
+        that are not 0x30 replies (relay keepalive/notice/other command
+        responses) are skipped so they fall through to the generic
+        classify/drain path instead of being force-fed to the power-flow
+        parser.
+        """
+        if resp is None or len(resp) < 4:
+            return False
+        return cls._POWER_FLOW_METHOD_MARKER in resp
 
     @classmethod
     def _is_session_expired(cls, resp: bytes) -> bool:

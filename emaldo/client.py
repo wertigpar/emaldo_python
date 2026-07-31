@@ -774,9 +774,20 @@ class EmaldoClient:
         with home_lock:
             # Double-check cache: another thread may have refreshed while we
             # were waiting on the per-home lock.  If the cache was updated
-            # within the last 5 s we reuse it even when *force_refresh* is
-            # set — this prevents back-to-back /home/e2e-login/ rotations
+            # within the home TTL (and this is NOT an escalation force) we
+            # reuse it — this prevents back-to-back /home/e2e-login/ rotations
             # when two devices on the same account both escalate (#47).
+            #
+            # CRITICAL: when *force_refresh* is set we MUST fall through to the
+            # API call below. The only caller that passes force_refresh=True
+            # here is e2e_login(force_home_refresh=_do_home_refresh), i.e. a
+            # genuine escalation (>=3 generations within 60s, see
+            # _get_e2e_credentials). If we short-circuited on the 5s grace we
+            # would replay the STALE home secret and the home-level rotation
+            # would never fire — leaving the stream wedged in a 21204 loop
+            # (#47, observed: 1128 "Stream saw 21204" over ~2h, force_home_refresh
+            # never emitted). Routine (non-escalation) forces keep force_refresh
+            # False here, so RC5's 5s dedupe still protects dual-unit ping-pong.
             with self._e2e_lock:
                 cached = self._home_e2e_cache.get(home_id)
                 if cached is not None:
@@ -786,37 +797,13 @@ class EmaldoClient:
                         and age <= self._home_e2e_ttl
                     ):
                         return dict(cached[0])
-                    if force_refresh and age < 5:
-                        _LOGGER.debug(
-                            "Home e2e cache %ds fresh — reusing for home_id=%s "
-                            "(age < 5s window, replaying latest secret to avoid "
-                            "dual-unit ping-pong)",
-                            int(age), home_id,
-                        )
-                        # Fire callbacks so late-registered sessions still
-                        # learn about the new secret.
-                        _callbacks = list(
-                            self._home_secret_callbacks.get(home_id, [])
-                        )
-                        # Release per-home lock before firing to avoid
-                        # deadlock (callbacks may acquire e2e locks).
-                        # (will be released by `with` context manager exit)
-                        for cb in _callbacks:
-                            try:
-                                cb(dict(cached[0]))
-                            except Exception:
-                                _LOGGER.exception(
-                                    "Home secret callback failed for "
-                                    "home_id=%s",
-                                    home_id,
-                                )
-                        return dict(cached[0])
 
             home_result = self.api_request(
                 "/home/e2e-login/", json_data={"home_id": home_id}
             )
             home_data = home_result.get("Result", {})
-            if not isinstance(home_data, dict) or "end_id" not in home_data:
+            if not isinstance(home_data, dict) or "end_id" not in home_data \
+               or not home_data.get("end_secret") or not home_data.get("chat_secret"):
                 raise EmaldoE2EError(f"Home e2e-login failed: {home_result}")
 
             with self._e2e_lock:
@@ -1054,7 +1041,13 @@ class EmaldoClient:
                     home_id, device_id, model,
                     force_home_refresh=_do_home_refresh,
                 )
-                generation = entry.generation + 1 if entry else 1
+                # After a successful home-level escalation, reset generation
+                # so the 60s escalation window does not re-trigger immediately
+                # on the next forced refresh (permanent 21204 storm).
+                if _do_home_refresh:
+                    generation = 1
+                else:
+                    generation = entry.generation + 1 if entry else 1
                 entry = E2ECredentialCacheEntry(
                     creds=creds,
                     created_at=now,
@@ -1226,23 +1219,42 @@ class EmaldoClient:
         smart_pct: int,
         emergency_pct: int,
         enable: bool = True,
+        slot_values: bytes | None = None,
         log: Callable[..., None] | None = None,
     ) -> bool:
         """Write the AI Battery Range — opcode 0x1AA0 with `enable` byte.
 
-        Mirrors the app's "Save Battery Range" button: sends the new
-        smart/emergency markers with all 96 per-slot overrides cleared to
-        ``SLOT_NO_OVERRIDE`` (0x80). ``enable=True`` activates
+        Mirrors the app's "Save Battery Range" button. Updates only the
+        smart/emergency markers and the ``battery_range_override`` flag,
+        **without clearing existing manual per-slot overrides** (issue #55):
+        the official app coexists a "customized" battery range with manual
+        slot plans, so setting the range must not wipe slot overrides and
+        editing slots must not wipe the range. ``enable=True`` activates
         "Battery Range = override" — AI must operate inside
         [emergency_pct, smart_pct]. ``enable=False`` reverts to AI-chosen
-        range while persisting the markers.
+        range while keeping the manual slot overrides.
+
+        If *slot_values* is provided (96 or 192 bytes), the existing
+        ``get_overrides()`` call is skipped entirely — the caller supplies
+        pre-fetched slot data (typically from the coordinator cache) so a
+        transient E2E read failure cannot accidentally wipe slots.
         """
         if not (0 <= smart_pct <= 100 and 0 <= emergency_pct <= 100):
             raise ValueError("smart_pct and emergency_pct must be 0..100")
         if smart_pct < emergency_pct:
             raise ValueError("smart_pct must be >= emergency_pct")
-        return self.reset_overrides(
-            home_id, device_id, model,
+        if slot_values is not None and len(slot_values) in (96, 192):
+            slots = slot_values
+        else:
+            current = self.get_overrides(home_id, device_id, model, log=log)
+            if current and "slots" in current and isinstance(current["slots"], (list, bytes)):
+                slots = bytes(current["slots"])
+            else:
+                slots = bytes([SLOT_NO_OVERRIDE] * 96)
+            if len(slots) not in (96, 192):
+                slots = bytes([SLOT_NO_OVERRIDE] * 96)
+        return self.set_override(
+            home_id, device_id, model, slots,
             high_marker=smart_pct, low_marker=emergency_pct,
             battery_range_override=enable, log=log,
         )

@@ -13,7 +13,7 @@ import string
 import struct
 import threading
 import time
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -27,6 +27,9 @@ from .const import (
     get_app_id,
 )
 from .exceptions import EmaldoE2EError, EmaldoE2ESessionExpired
+
+if TYPE_CHECKING:
+    from ..storm_state import HomeStormState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -821,6 +824,303 @@ def parse_battery_data(payload: bytes) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------------------
+# Accessory state (Fans Pack 01-03 + Water Sensor)
+#
+# The device also pushes unsolicited ``cabinet_state_changed`` frames
+# (opcode 8199, wire byte 0x07) with the same state layout as
+# ``get_cabinet_state``; this module polls the request/response types only.
+_CABINET_ALLINFO_TYPE = 0x0E
+_CABINET_STATE_TYPE = 0x0D
+_INVERTER_INFO_TYPE = 0x04
+# Bounded set of cabinet indices probed for accessory state. The
+# ``get_cabinet_allinfo`` (0x0E) first byte is NOT a reliable cabinet count
+# (it decodes to a large/unstable value on real firmware), so we never use
+# it to bound the per-cabinet loop — we probe a fixed range and keep whichever
+# cabinets actually reply. 4 matches the Water Sensor design (issue #63).
+ACCESSORY_MAX_CABINETS = 4
+
+
+def parse_cabinet_state(payload: bytes | None) -> dict | None:
+    """Parse a ``get_cabinet_state`` (type 0x0D) response payload.
+
+    Layout (per ``Mcu.Cabinet`` enums + ``sd/f0.java`` in the app; values
+    on the wire are the enums' *stateValue*, not their code):
+
+        byte 0   water state  (0 = valid/dry, 1 = exception/water)
+        byte 1   smoke state  (0 = valid, 1 = exception)
+        byte 2   fan state    (0 = stopped, 1 = running, 2 = exception)
+        byte 3   exception bitmap (bit 0 = Communication)
+        byte 4   firmware version length N
+        bytes 5..5+N   firmware version (ASCII)
+        byte 5+N cabinet index
+
+    Returns a dict with ``water``, ``smoke``, ``fan``, ``exceptions`` and
+    ``index`` keys, or *None* if the payload is too short.
+    """
+    if not payload or len(payload) < 5:
+        return None
+    water = payload[0]
+    smoke = payload[1]
+    fan = payload[2]
+    exc_bits = payload[3]
+    exceptions: list[int] = []
+    if (exc_bits >> 0) & 1:
+        exceptions.append(4)  # Mcu.Cabinet.CabinetException.Communication
+    ver_len = payload[4]
+    offset = 5 + ver_len
+    if len(payload) < offset + 1:
+        return None
+    index = payload[offset]
+    return {
+        # Normalise to the app's enum codes: 1 = valid/stop, 2 = exception,
+        # 2 = running for fans, 3 = fan exception (CabinetFanState codes).
+        "water": 2 if water == 1 else 1 if water == 0 else -1,
+        "smoke": 2 if smoke == 1 else 1 if smoke == 0 else -1,
+        "fan": 3 if fan == 2 else 2 if fan == 1 else 1 if fan == 0 else -1,
+        "exceptions": exceptions,
+        "version": payload[5 : 5 + ver_len].decode("utf-8", "replace") if ver_len else "",
+        "index": index,
+    }
+
+
+def parse_inverter_info(payload: bytes | None) -> dict | None:
+    """Parse a ``get_inverter_info`` (type 0x04) response payload.
+
+    Layout (per ``sd/v0.smali`` in the app):
+
+        byte 0      inverter state (raw stateValue)
+        bytes 1-2   battery exceptions bitmap (u16 LE)
+        bytes 3-4   inverter exceptions bitmap (u16 LE)
+        bytes 5-6   grid exceptions bitmap (u16 LE)
+        bytes 7-8   system exceptions bitmap (u16 LE, bit 12 = Fan fault)
+        bytes 9-10  MPPT exceptions bitmap (u16 LE)
+        bytes 11-12 present exceptions bitmap (u16 LE)
+        bytes 13-14 DC exceptions bitmap (u16 LE)
+        byte 15     idInfo length N, then N bytes ASCII idInfo
+        byte (var)  version length M, then M bytes firmware version
+        byte (var)  fan state (0 = stopped, 1 = running)
+        byte (var)  inverter index
+
+    Returns a dict with ``state``, ``system_exceptions``, ``fan_state``
+    and ``index`` keys, or *None* if the payload is too short.
+    """
+    if not payload or len(payload) < 19:
+        return None
+    offset = 15
+    id_len = payload[offset]
+    offset += 1 + id_len
+    if len(payload) < offset + 1:
+        return None
+    ver_len = payload[offset]
+    offset += 1 + ver_len
+    if len(payload) < offset + 2:
+        return None
+    fan_raw = payload[offset]
+    index = payload[offset + 1]
+
+    def _bits(raw: int) -> list[int]:
+        return [bit + 1 for bit in range(16) if (raw >> bit) & 1]
+
+    system = _bits(int.from_bytes(payload[7:9], "little"))
+    return {
+        "state": payload[0],
+        "system_exceptions": system,
+        # InverterFanState codes: 1 = STOP, 2 = RUNNING; the enum cannot
+        # represent a fan *fault* (that arrives via InverterSystemException
+        # Fan = 13), so raw values outside 0/1 map to -1 (unknown).
+        "fan_state": 2 if fan_raw == 1 else 1 if fan_raw == 0 else -1,
+        "index": index,
+    }
+
+
+def read_accessories(
+    e2e_creds: dict,
+    *,
+    timeout: float = 4.0,
+    probe_timeout: float = 1.5,
+    inverters: int = 3,
+    log: Callable[..., None] | None = None,
+) -> dict | None:
+    """Read PowerStation accessory state (fans + water sensor) via E2E.
+
+    Performs the full session flow (alive → heartbeat) on a one-shot socket
+    then issues, in order:
+
+    * ``get_cabinet_allinfo`` (0x0E) → number of battery cabinets
+    * ``get_cabinet_state`` (0x0D, cabinets 0..count-1) → per-cabinet
+      water/smoke/fan state
+    * ``get_inverter_info`` (0x04, inverters 0..N-1) → per-inverter fan
+      state (Fans Pack 01..03 on three-phase hardware)
+
+    Args:
+        e2e_creds: E2E credentials (from ``EmaldoClient.get_e2e_credentials``).
+        timeout: Socket timeout (seconds) for the handshake packets.
+        probe_timeout: Socket timeout (seconds) for each state probe.
+        inverters: Number of inverter indices to probe (1 = single-phase,
+            3 = three-phase "Fans Pack 01-03").
+        log: Optional log callback.
+
+    Returns:
+        Dict with ``cabinet_count``, ``cabinets`` (dict keyed by cabinet
+        index, each a parsed cabinet state), ``cabinet`` (alias of
+        ``cabinets[0]``, kept for the single-cabinet Water Sensor) and
+        ``inverters`` (dict keyed by inverter index), or *None* if the
+        cabinet-allinfo probe failed entirely.
+    """
+    session_nonce = generate_nonce()
+    home_alive = build_alive_packet(
+        e2e_creds,
+        "home",
+        session_nonce,
+        end_secret=e2e_creds["sender_end_secret"],
+    )
+    dev_alive = build_alive_packet(
+        e2e_creds,
+        "device",
+        session_nonce,
+        end_secret=e2e_creds["sender_end_secret"],
+    )
+    heartbeat = build_heartbeat_packet(e2e_creds, session_nonce)
+    wake = build_wake_packet(e2e_creds, session_nonce)
+
+    host, port = _resolve_host(e2e_creds["host"])
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    addr = (host, port)
+
+    def _send(pkt: bytes, label: str) -> bytes | None:
+        sock.sendto(pkt, addr)
+        try:
+            resp, _ = sock.recvfrom(4096)
+            if log:
+                log(f"{label}: sent {len(pkt)}B → got {len(resp)}B")
+            return resp
+        except socket.timeout:
+            if log:
+                log(f"{label}: sent {len(pkt)}B → no response")
+            return None
+
+    def _probe(pkt_label: str, pkt: bytes, validate: Callable[[bytes], bool]):
+        """Send one request and return its decrypted payload (or None)."""
+        _drain(sock)
+        raw = _send(pkt, pkt_label)
+        if not raw:
+            return None
+        decrypted = decrypt_response(
+            raw, e2e_creds["chat_secret"],
+            payload_validator=validate,
+            silent=True,
+        )
+        if decrypted is None:
+            # First datagram may be a subscription ACK — try one follow-up.
+            try:
+                raw2, _ = sock.recvfrom(4096)
+                if log:
+                    log(f"{pkt_label} follow-up: {len(raw2)}B")
+                decrypted = decrypt_response(
+                    raw2, e2e_creds["chat_secret"],
+                    payload_validator=validate,
+                    silent=True,
+                )
+            except socket.timeout:
+                pass
+        return decrypted
+
+    result: dict = {"cabinet_count": 0, "cabinets": {}, "cabinet": None, "inverters": {}}
+    try:
+        _send(home_alive, "Alive(home)")
+        _send(dev_alive, "Alive(device)")
+        _send(wake, "Wake")
+        _send(heartbeat, "Heartbeat")
+        time.sleep(0.2)
+        sock.settimeout(probe_timeout)
+
+        # 1) Cabinet allinfo (0x0E, empty payload). Its first byte is NOT a
+        # usable cabinet count — it decodes to 2/3/4 on single-cabinet devices
+        # and to a runaway ~194 on others — so we NEVER use it to bound the
+        # loop or drive discovery. We only probe a bounded set of indices and
+        # keep whichever cabinets actually reply.
+        _probe(
+            "CabinetAllInfo", build_subscription_packet(
+                e2e_creds, _CABINET_ALLINFO_TYPE, session_nonce,
+                payload=b"", request_mode=True,
+            ),
+            lambda p: len(p) >= 1,
+        )
+
+        # 2) Per-cabinet state (0x0D, payload [index]) for a BOUNDED set of
+        # cabinet indices. Validators also constrain the raw state bytes
+        # (0/1 water+smoke, 0-2 fan) so the relay's decrypted JSON status
+        # frames (``{"__time"...``) cannot pass a bare length check.
+        cabinets: dict[int, dict] = {}
+        for cidx in range(ACCESSORY_MAX_CABINETS):
+            pkt = build_subscription_packet(
+                e2e_creds, _CABINET_STATE_TYPE, session_nonce,
+                payload=bytes([cidx]), request_mode=True,
+            )
+            dec = _probe(
+                f"CabinetState(idx={cidx})", pkt,
+                lambda p: len(p) >= 5 and p[0] in (0, 1) and p[1] in (0, 1)
+                and p[2] in (0, 1, 2),
+            )
+            if dec is not None:
+                state = parse_cabinet_state(dec)
+                # The validator above only constrains water/smoke/fan bytes, so a
+                # relay echo or a reply for a different cabinet index could pass.
+                # The device reports its own cabinet index in the payload — but it
+                # ECHOES the index we probed even for cabinets that do not exist,
+                # so an index-only guard cannot tell real from phantom (#63). Real
+                # cabinets reply with a non-empty firmware version (e.g. 0x12);
+                # phantom replies for absent cabinets carry an all-zero version
+                # (0x00). Require a real, non-empty, non-NUL version on top of the
+                # index match, so a phantom reply never inflates cabinet_count.
+                if state is not None and state.get("index") == cidx:
+                    version = state.get("version") or ""
+                    if any(ord(c) != 0 for c in version):
+                        cabinets[cidx] = state
+        result["cabinets"] = cabinets
+        # Number of cabinets that ACTUALLY replied (drives Water Sensor
+        # discovery). Single-cabinet devices report 1, two-cabinet devices 2,
+        # regardless of what the allinfo first byte claims.
+        result["cabinet_count"] = len(cabinets)
+        # Backward-compatible alias for the single-cabinet Water Sensor.
+        result["cabinet"] = cabinets.get(0)
+
+        # 3) Inverter info per index (0x04, payload [index]).
+        # Byte 0 = InverterState raw value (0-2); constrain it like the
+        # cabinet-state validator so JSON status frames cannot pass.
+        for idx in range(max(1, inverters)):
+            pkt = build_subscription_packet(
+                e2e_creds, _INVERTER_INFO_TYPE, session_nonce,
+                payload=bytes([idx]), request_mode=True,
+            )
+            dec = _probe(
+                f"InverterInfo(idx={idx})", pkt,
+                lambda p: len(p) >= 19 and p[0] in (0, 1, 2),
+            )
+            if dec is not None:
+                info = parse_inverter_info(dec)
+                if info is not None:
+                    result["inverters"][idx] = info
+
+        return result
+    finally:
+        sock.close()
+
+
+def _drain(sock: socket.socket) -> None:
+    """Discard stale UDP datagrams queued on *sock* (late replies)."""
+    cur_timeout = sock.gettimeout()
+    sock.settimeout(0)
+    while True:
+        try:
+            sock.recvfrom(4096)
+        except OSError:
+            break
+    sock.settimeout(cur_timeout)
+
+
 _POWER_FLOW_MAX_RAW_HECTOWATTS = 2000  # 200 kW per channel; filters bogus multi-MW spikes
 
 
@@ -1334,309 +1634,6 @@ def read_battery_info(
         return batteries
     finally:
         sock.close()
-
-
-# -- PowerStation accessories (Fan Pack / Water Sensor) -----------------------
-#
-# Wire types are the low byte of the MCU Msct OPTION_METHOD opcode (same
-# scheme as the existing 0x06 battery-info probe, which is opcode 4102 =
-# 0x1006).  Discovered from the Emaldo app 2.8.8 decompilation:
-#
-#   get_cabinet_allinfo   opcode 4110 (0x100E)  payload: none
-#   get_cabinet_state     opcode 4109 (0x100D)  payload: [index]
-#   get_inverter_info     opcode 4100 (0x1004)  payload: [index]
-#
-# The device also pushes unsolicited ``cabinet_state_changed`` frames
-# (opcode 8199, wire byte 0x07) with the same state layout as
-# ``get_cabinet_state``; this module polls the request/response types only.
-_CABINET_ALLINFO_TYPE = 0x0E
-_CABINET_STATE_TYPE = 0x0D
-_INVERTER_INFO_TYPE = 0x04
-# Bounded set of cabinet indices probed for accessory state. The
-# ``get_cabinet_allinfo`` (0x0E) first byte is NOT a reliable cabinet count
-# (it decodes to a large/unstable value on real firmware), so we never use
-# it to bound the per-cabinet loop — we probe a fixed range and keep whichever
-# cabinets actually reply. 4 matches the Water Sensor design (issue #63).
-ACCESSORY_MAX_CABINETS = 4
-
-
-def parse_cabinet_state(payload: bytes | None) -> dict | None:
-    """Parse a ``get_cabinet_state`` (type 0x0D) response payload.
-
-    Layout (per ``Mcu.Cabinet`` enums + ``sd/f0.java`` in the app; values
-    on the wire are the enums' *stateValue*, not their code):
-
-        byte 0   water state  (0 = valid/dry, 1 = exception/water)
-        byte 1   smoke state  (0 = valid, 1 = exception)
-        byte 2   fan state    (0 = stopped, 1 = running, 2 = exception)
-        byte 3   exception bitmap (bit 0 = Communication)
-        byte 4   firmware version length N
-        bytes 5..5+N   firmware version (ASCII)
-        byte 5+N cabinet index
-
-    Returns a dict with ``water``, ``smoke``, ``fan``, ``exceptions`` and
-    ``index`` keys, or *None* if the payload is too short.
-    """
-    if not payload or len(payload) < 5:
-        return None
-    water = payload[0]
-    smoke = payload[1]
-    fan = payload[2]
-    exc_bits = payload[3]
-    exceptions: list[int] = []
-    if (exc_bits >> 0) & 1:
-        exceptions.append(4)  # Mcu.Cabinet.CabinetException.Communication
-    ver_len = payload[4]
-    offset = 5 + ver_len
-    if len(payload) < offset + 1:
-        return None
-    index = payload[offset]
-    return {
-        # Normalise to the app's enum codes: 1 = valid/stop, 2 = exception,
-        # 2 = running for fans, 3 = fan exception (CabinetFanState codes).
-        "water": 2 if water == 1 else 1 if water == 0 else -1,
-        "smoke": 2 if smoke == 1 else 1 if smoke == 0 else -1,
-        "fan": 3 if fan == 2 else 2 if fan == 1 else 1 if fan == 0 else -1,
-        "exceptions": exceptions,
-        "version": payload[5 : 5 + ver_len].decode("utf-8", "replace") if ver_len else "",
-        "index": index,
-    }
-
-
-def parse_inverter_info(payload: bytes | None) -> dict | None:
-    """Parse a ``get_inverter_info`` (type 0x04) response payload.
-
-    Layout (per ``sd/v0.smali`` in the app):
-
-        byte 0      inverter state (raw stateValue)
-        bytes 1-2   battery exceptions bitmap (u16 LE)
-        bytes 3-4   inverter exceptions bitmap (u16 LE)
-        bytes 5-6   grid exceptions bitmap (u16 LE)
-        bytes 7-8   system exceptions bitmap (u16 LE, bit 12 = Fan fault)
-        bytes 9-10  MPPT exceptions bitmap (u16 LE)
-        bytes 11-12 present exceptions bitmap (u16 LE)
-        bytes 13-14 DC exceptions bitmap (u16 LE)
-        byte 15     idInfo length N, then N bytes ASCII idInfo
-        byte (var)  version length M, then M bytes firmware version
-        byte (var)  fan state (0 = stopped, 1 = running)
-        byte (var)  inverter index
-
-    Returns a dict with ``state``, ``system_exceptions``, ``fan_state``
-    and ``index`` keys, or *None* if the payload is too short.
-    """
-    if not payload or len(payload) < 19:
-        return None
-    offset = 15
-    id_len = payload[offset]
-    offset += 1 + id_len
-    if len(payload) < offset + 1:
-        return None
-    ver_len = payload[offset]
-    offset += 1 + ver_len
-    if len(payload) < offset + 2:
-        return None
-    fan_raw = payload[offset]
-    index = payload[offset + 1]
-
-    def _bits(raw: int) -> list[int]:
-        return [bit + 1 for bit in range(16) if (raw >> bit) & 1]
-
-    system = _bits(int.from_bytes(payload[7:9], "little"))
-    return {
-        "state": payload[0],
-        "system_exceptions": system,
-        # InverterFanState codes: 1 = STOP, 2 = RUNNING; the enum cannot
-        # represent a fan *fault* (that arrives via InverterSystemException
-        # Fan = 13), so raw values outside 0/1 map to -1 (unknown).
-        "fan_state": 2 if fan_raw == 1 else 1 if fan_raw == 0 else -1,
-        "index": index,
-    }
-
-
-def read_accessories(
-    e2e_creds: dict,
-    *,
-    timeout: float = 4.0,
-    probe_timeout: float = 1.5,
-    inverters: int = 3,
-    log: Callable[..., None] | None = None,
-) -> dict | None:
-    """Read PowerStation accessory state (fans + water sensor) via E2E.
-
-    Performs the full session flow (alive → heartbeat) on a one-shot socket
-    then issues, in order:
-
-    * ``get_cabinet_allinfo`` (0x0E) → number of battery cabinets
-    * ``get_cabinet_state`` (0x0D, cabinets 0..count-1) → per-cabinet
-      water/smoke/fan state
-    * ``get_inverter_info`` (0x04, inverters 0..N-1) → per-inverter fan
-      state (Fans Pack 01..03 on three-phase hardware)
-
-    Args:
-        e2e_creds: E2E credentials (from ``EmaldoClient.get_e2e_credentials``).
-        timeout: Socket timeout (seconds) for the handshake packets.
-        probe_timeout: Socket timeout (seconds) for each state probe.
-        inverters: Number of inverter indices to probe (1 = single-phase,
-            3 = three-phase "Fans Pack 01-03").
-        log: Optional log callback.
-
-    Returns:
-        Dict with ``cabinet_count``, ``cabinets`` (dict keyed by cabinet
-        index, each a parsed cabinet state), ``cabinet`` (alias of
-        ``cabinets[0]``, kept for the single-cabinet Water Sensor) and
-        ``inverters`` (dict keyed by inverter index), or *None* if the
-        cabinet-allinfo probe failed entirely.
-    """
-    session_nonce = generate_nonce()
-
-    home_alive = build_alive_packet(
-        sender_end_id=e2e_creds["home_end_id"],
-        sender_group_id=e2e_creds["home_group_id"],
-        end_secret=e2e_creds["home_end_secret"],
-    )
-    dev_alive = build_alive_packet(
-        sender_end_id=e2e_creds["sender_end_id"],
-        sender_group_id=e2e_creds["sender_group_id"],
-        end_secret=e2e_creds["sender_end_secret"],
-    )
-    heartbeat = build_heartbeat_packet(e2e_creds, session_nonce)
-    wake = build_wake_packet(e2e_creds, session_nonce)
-
-    host, port = _resolve_host(e2e_creds["host"])
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
-    addr = (host, port)
-
-    def _send(pkt: bytes, label: str) -> bytes | None:
-        sock.sendto(pkt, addr)
-        try:
-            resp, _ = sock.recvfrom(4096)
-            if log:
-                log(f"{label}: sent {len(pkt)}B → got {len(resp)}B")
-            return resp
-        except socket.timeout:
-            if log:
-                log(f"{label}: sent {len(pkt)}B → no response")
-            return None
-
-    def _probe(pkt_label: str, pkt: bytes, validate: Callable[[bytes], bool]):
-        """Send one request and return its decrypted payload (or None)."""
-        _drain(sock)
-        raw = _send(pkt, pkt_label)
-        if not raw:
-            return None
-        decrypted = decrypt_response(
-            raw, e2e_creds["chat_secret"],
-            payload_validator=validate,
-            silent=True,
-        )
-        if decrypted is None:
-            # First datagram may be a subscription ACK — try one follow-up.
-            try:
-                raw2, _ = sock.recvfrom(4096)
-                if log:
-                    log(f"{pkt_label} follow-up: {len(raw2)}B")
-                decrypted = decrypt_response(
-                    raw2, e2e_creds["chat_secret"],
-                    payload_validator=validate,
-                    silent=True,
-                )
-            except socket.timeout:
-                pass
-        return decrypted
-
-    result: dict = {"cabinet_count": 0, "cabinets": {}, "cabinet": None, "inverters": {}}
-    try:
-        _send(home_alive, "Alive(home)")
-        _send(dev_alive, "Alive(device)")
-        _send(wake, "Wake")
-        _send(heartbeat, "Heartbeat")
-        time.sleep(0.2)
-        sock.settimeout(probe_timeout)
-
-        # 1) Cabinet allinfo (0x0E, empty payload). Its first byte is NOT a
-        # usable cabinet count — it decodes to 2/3/4 on single-cabinet devices
-        # and to a runaway ~194 on others — so we NEVER use it to bound the
-        # loop or drive discovery. We only probe a bounded set of indices and
-        # keep whichever cabinets actually reply.
-        _probe(
-            "CabinetAllInfo", build_subscription_packet(
-                e2e_creds, _CABINET_ALLINFO_TYPE, session_nonce,
-                payload=b"", request_mode=True,
-            ),
-            lambda p: len(p) >= 1,
-        )
-
-        # 2) Per-cabinet state (0x0D, payload [index]) for a BOUNDED set of
-        # cabinet indices. Validators also constrain the raw state bytes
-        # (0/1 water+smoke, 0-2 fan) so the relay's decrypted JSON status
-        # frames (``{"__time"...``) cannot pass a bare length check.
-        cabinets: dict[int, dict] = {}
-        for cidx in range(ACCESSORY_MAX_CABINETS):
-            pkt = build_subscription_packet(
-                e2e_creds, _CABINET_STATE_TYPE, session_nonce,
-                payload=bytes([cidx]), request_mode=True,
-            )
-            dec = _probe(
-                f"CabinetState(idx={cidx})", pkt,
-                lambda p: len(p) >= 5 and p[0] in (0, 1) and p[1] in (0, 1)
-                and p[2] in (0, 1, 2),
-            )
-            if dec is not None:
-                state = parse_cabinet_state(dec)
-                # The validator above only constrains water/smoke/fan bytes, so a
-                # relay echo or a reply for a different cabinet index could pass.
-                # The device reports its own cabinet index in the payload — but it
-                # ECHOES the index we probed even for cabinets that do not exist,
-                # so an index-only guard cannot tell real from phantom (#63). Real
-                # cabinets reply with a non-empty firmware version (e.g. 0x12);
-                # phantom replies for absent cabinets carry an all-zero version
-                # (0x00). Require a real, non-empty, non-NUL version on top of the
-                # index match, so a phantom reply never inflates cabinet_count.
-                if state is not None and state.get("index") == cidx:
-                    version = state.get("version") or ""
-                    if any(ord(c) != 0 for c in version):
-                        cabinets[cidx] = state
-        result["cabinets"] = cabinets
-        # Number of cabinets that ACTUALLY replied (drives Water Sensor
-        # discovery). Single-cabinet devices report 1, two-cabinet devices 2,
-        # regardless of what the allinfo first byte claims.
-        result["cabinet_count"] = len(cabinets)
-        # Backward-compatible alias for the single-cabinet Water Sensor.
-        result["cabinet"] = cabinets.get(0)
-
-        # 3) Inverter info per index (0x04, payload [index]).
-        # Byte 0 = InverterState raw value (0-2); constrain it like the
-        # cabinet-state validator so JSON status frames cannot pass.
-        for idx in range(max(1, inverters)):
-            pkt = build_subscription_packet(
-                e2e_creds, _INVERTER_INFO_TYPE, session_nonce,
-                payload=bytes([idx]), request_mode=True,
-            )
-            dec = _probe(
-                f"InverterInfo(idx={idx})", pkt,
-                lambda p: len(p) >= 19 and p[0] in (0, 1, 2),
-            )
-            if dec is not None:
-                info = parse_inverter_info(dec)
-                if info is not None:
-                    result["inverters"][idx] = info
-
-        return result
-    finally:
-        sock.close()
-
-
-def _drain(sock: socket.socket) -> None:
-    """Discard stale UDP datagrams queued on *sock* (late replies)."""
-    cur_timeout = sock.gettimeout()
-    sock.settimeout(0)
-    while True:
-        try:
-            sock.recvfrom(4096)
-        except OSError:
-            break
-    sock.settimeout(cur_timeout)
 
 
 def _log_power_flow_raw(payload: bytes, log: Callable[..., None]) -> None:
@@ -3634,6 +3631,12 @@ class PersistentE2ESession:
     #: briefly before rebuilding the session.
     RECONNECT_BACKOFF_SECONDS = 2.0
 
+    #: Max in-place long_stall reconnects per stall episode before quiescing.
+    #: Each handshake re-invokes the device's slow stream startup; past this
+    #: quota the coordinator's full-reset escalation is the only recovery that
+    #: works, so stop hammering the relay (storm fix, same episode as A).
+    STREAM_STALL_EPISODE_MAX_RECONNECTS = 3
+
     #: Extra packet drain budget after a power-flow request when the first
     #: response is not the power payload itself (for example subscription ACKs
     #: or unrelated pushes arriving first on a healthy session).
@@ -3741,6 +3744,8 @@ class PersistentE2ESession:
         self._last_subscribe_monotonic: float | None = None
         self._stream_needs_reconnect = False
         self._stream_needs_creds_refresh = False
+        self._stream_last_rebuild_monotonic: float | None = None
+        self._stream_stall_episode_reconnects = 0
         self._stream_resubscribe_interval = 12.0
         self._stream_keepalive_interval = 7.0
         self._stream_drain_timeout = 0.4
@@ -3805,9 +3810,11 @@ class PersistentE2ESession:
         # escalation so a never-yet-healthy session (cold start, inverter
         # offline) is not punished as a stale-secret failure.
         self._stream_last_decrypted_frame_ts: float = 0.0
+        self._stream_ever_decrypted = False
+        # Monotonic timestamps of the last benign relay datagrams, for the
+        # stream_diagnostics age sensors (c182951).
         self._stream_last_ack_monotonic: float = 0.0
         self._stream_last_relay_status_monotonic: float = 0.0
-        self._stream_ever_decrypted = False
         # Deadline by which a decrypted frame must arrive after a handshake-ok
         # reconnect, else the reconnect is treated as decrypt-failed. Armed in
         # _stream_reconnect_locked; None when no gate is pending.
@@ -4203,6 +4210,7 @@ class PersistentE2ESession:
         min_resubscribe_gap: float = 5.0,
         stale_after: float = 20.0,
         long_stall: float = 45.0,
+        storm_state: "HomeStormState | None" = None,
     ) -> None:
         """Start the background power-flow stream receiver.
 
@@ -4238,6 +4246,8 @@ class PersistentE2ESession:
             self._stream_stale_after = stale_after
             self._stream_long_stall = long_stall
             self._stream_stop.clear()
+            self._storm_state = storm_state
+            self._seed_storm_state()
             self._last_subscribe_monotonic = None  # subscribe immediately
             self._last_keepalive_monotonic = time.perf_counter()
             self._stream_started_monotonic = time.perf_counter()
@@ -4249,6 +4259,17 @@ class PersistentE2ESession:
                 daemon=True,
             )
             self._stream_thread.start()
+    def _seed_storm_state(self) -> None:
+        """Copy holder counters into session fields (plan 1.3, called from start_stream)."""
+        st: HomeStormState | None = getattr(self, "_storm_state", None)
+        if st is None:
+            return
+        self._stream_reconnect_streak = st.reconnect_streak
+        self._stream_ever_decrypted = st.ever_decrypted
+        # Anchor to live frames of THIS session so the streak-reset branch
+        # (frames_received != anchor) is judged against this session.
+        self._stream_reconnect_backoff_anchor_frames = self._stream_frames_received
+
     def stop_stream(self) -> None:
         """Signal the stream receiver to stop and join it (best effort)."""
         self._stream_stop.set()
@@ -4454,6 +4475,18 @@ class PersistentE2ESession:
             self._stream_needs_creds_refresh = True
             self._stream_flag_reconnect("decrypt_gate_no_frame")
             return
+        # Post-rebuild grace (storm fix): a freshly rebuilt session must get
+        # its full stall window before the watchdog can re-arm long_stall.
+        # Without this, the stale pre-rebuild frame timestamp re-triggers the
+        # stall check immediately after a successful handshake and the stream
+        # reconnects every backoff second (handshake-ok resets the streak),
+        # hammering the relay until the coordinator's full reset (#47 storm).
+        if (
+            self._stream_last_rebuild_monotonic is not None
+            and (now - self._stream_last_rebuild_monotonic)
+            < self._stream_long_stall
+        ):
+            return
         # Latest frame across all devices (per-device cache, beta15f)
         latest_ts = max(self._latest_power_flow_monotonic.values()) if self._latest_power_flow_monotonic else None
         reference = latest_ts if latest_ts is not None else self._stream_started_monotonic
@@ -4470,6 +4503,14 @@ class PersistentE2ESession:
                     f"Stream long-stall ({kind}, "
                     f"{now - reference:.0f}s) — forcing in-place reconnect"
                 )
+            if (
+                self._stream_stall_episode_reconnects
+                >= self.STREAM_STALL_EPISODE_MAX_RECONNECTS
+            ):
+                # Quota exhausted: stop in-place long_stall reconnects. The
+                # coordinator's 120s wedge escalation does the full REST
+                # rebuild — that is the recovery that actually works here.
+                return
             self._stream_flag_reconnect("long_stall")
 
     def _stream_maybe_subscribe_locked(self, now: float) -> None:
@@ -4641,12 +4682,18 @@ class PersistentE2ESession:
                     self._latest_power_flow[dev_id] = pf
                     self._latest_power_flow_monotonic[dev_id] = _now_pf
                     self._stream_frames_received += 1
+                    # Storm fix: a fresh frame closes the stall episode, so the
+                    # next long_stall gets a fresh reconnect quota.
+                    self._stream_stall_episode_reconnects = 0
                     # Decrypt-gate bookkeeping (#53 Q1/Q3): a frame decrypted
                     # cleanly, so the current chat_secret is valid. Record the
                     # time, mark the session as having ever decrypted, and clear
                     # any pending reconnect decrypt-gate deadline.
                     self._stream_last_decrypted_frame_ts = _now_pf
                     self._stream_ever_decrypted = True
+                    st = getattr(self, "_storm_state", None)
+                    if st is not None:
+                        st.ever_decrypted = True
                     self._stream_decrypt_gate_deadline = None
                     continue
 
@@ -4812,10 +4859,15 @@ class PersistentE2ESession:
         so reads stay responsive while the backoff elapses. When the deadline
         passes a later call performs the actual rebuild.
 
-        Escalation only grows across consecutive FAILED handshakes (a genuinely
-        penalized relay). A successful handshake — or any received frame —
-        resets the streak so a single competing read cannot ratchet the backoff
-        up to the ceiling (beta13e).
+        Escalation grows across consecutive *frameless* rebuilds. The streak is
+        reset ONLY when a fresh frame arrived since the previous rebuild (proof
+        the relay is genuinely delivering again) — NOT merely because a
+        handshake returned "ok". During a backend 21204 episode the relay keeps
+        accepting handshakes but withholds frames, so treating handshake-ok as
+        recovery pinned the backoff at its 2 s base and hammered the relay
+        (~2000 rebuilds in 2 h) instead of backing off to the ceiling (beta37).
+        A single competing read cannot ratchet it up either, since it likewise
+        delivers no frames.
         """
         if self._closed:
             return
@@ -4832,12 +4884,18 @@ class PersistentE2ESession:
                 self._stream_reconnect_backoff_anchor_frames = (
                     self._stream_frames_received
                 )
+                st = getattr(self, "_storm_state", None)
+                if st is not None:
+                    st.note_frame()
             backoff = min(
                 self.RECONNECT_BACKOFF_SECONDS * (2 ** self._stream_reconnect_streak),
                 self._stream_reconnect_backoff_max,
             )
             self._stream_reconnect_streak += 1
             self._stream_reconnect_not_before = now + backoff
+            st = getattr(self, "_storm_state", None)
+            if st is not None:
+                st.reconnect_streak = self._stream_reconnect_streak
             if self._log:
                 self._log(
                     f"Stream reconnect scheduled in {backoff:.1f}s "
@@ -4853,13 +4911,24 @@ class PersistentE2ESession:
         # Deadline reached: perform the actual rebuild.
         self._stream_reconnect_not_before = None
         try:
-            # If a forced credential refresh is already pending (a 21204 flagged
-            # it, or the decrypt-gate escalated because handshake-ok frames never
-            # decrypted — #53 Q1/Q3), refresh creds BEFORE the first reconnect.
-            # Otherwise the re-handshake reuses the stale chat_secret, succeeds
-            # at the transport level, and the decrypt gate would loop forever
-            # because the force flag is only consumed by _refresh_creds_locked.
-            if self._stream_needs_creds_refresh:
+            # A forced credential refresh pending because of a rekey-style
+            # escalation (decrypt-gate timeout — handshake ok but frames never
+            # decrypted, #53 Q1/Q3; or force_logout / long_stall binding drop)
+            # still pre-rotates: the chat_secret genuinely cannot decrypt the
+            # push stream anymore.
+            #
+            # A plain 21204 does NOT qualify (beta38): it only proves the relay
+            # expired the *session*, not that the current credential generation
+            # is stale. Pre-rotating device creds on every flagged rebuild
+            # orphans the generation the session is bound to, so each rotation
+            # re-arms the next 21204 — a self-sustaining treadmill that survives
+            # the original backend window and persists until a HA restart
+            # re-initializes state. Instead, first re-handshake with the current
+            # creds; a handshake "ok" proves they are still the server's live
+            # generation and the session survives. On handshake failure the
+            # branch below refreshes and reconnects exactly as before.
+            is_plain_21204 = "21204" in (self._stream_last_reconnect_reason or "")
+            if self._stream_needs_creds_refresh and not is_plain_21204:
                 self._refresh_creds_locked()
             # Try re-handshake with current creds first (#47 beta16b).
             # If handshake succeeds, creds are still valid — skip the
@@ -4894,6 +4963,9 @@ class PersistentE2ESession:
                 self._last_subscribe_monotonic = _now_mono
             self._last_keepalive_monotonic = time.perf_counter()
             self._stream_started_monotonic = time.perf_counter()  # reset watchdog
+            # Storm fix: record the rebuild so the watchdog grants the full
+            # stall window before re-arming long_stall.
+            self._stream_last_rebuild_monotonic = time.perf_counter()
             self._stream_reconnects += 1
             # Count the reason on the actual rebuild so it stays in lockstep with
             # the reconnect counter (one entry per rebuild, not per flag-set).
@@ -4901,9 +4973,20 @@ class PersistentE2ESession:
             self._stream_reconnect_reasons[_r] = (
                 self._stream_reconnect_reasons.get(_r, 0) + 1
             )
-            # A successful handshake clears the escalation: the next 21204 starts
-            # fresh at the base backoff instead of inheriting a tall streak.
-            self._stream_reconnect_streak = 0
+            # Storm fix: count in-place long_stall rebuilds toward the episode
+            # quota used by the watchdog quiesce check.
+            if "long_stall" in (self._stream_last_reconnect_reason or ""):
+                self._stream_stall_episode_reconnects += 1
+            # beta37: a successful *handshake* is NOT proof the stream recovered
+            # (see the decrypt-gate note below — the relay can reply "ok" while
+            # never delivering a frame). Do NOT clear the escalation streak here;
+            # it is reset only in the scheduling branch above when a genuinely
+            # fresh frame has arrived since the last rebuild. Clearing it on
+            # handshake-ok pinned the backoff at the 2 s base during a 21204
+            # episode, producing ~2000 rebuilds in 2 h (and re-forcing a
+            # credential rotation every cycle). Still re-anchor to the current
+            # frame count so the next scheduling pass compares against post-
+            # rebuild frames.
             self._stream_reconnect_backoff_anchor_frames = self._stream_frames_received
             # Decrypt-gated reconnect success (#53 Q1/Q3): a handshake-ok does
             # NOT prove the chat_secret can still decrypt frames. If this session
@@ -5653,6 +5736,10 @@ class PersistentE2ESession:
                 except Exception:  # noqa: BLE001
                     pass
                 self._sock = None
+            st = getattr(self, "_storm_state", None)
+            if st is not None:
+                st.reconnect_streak = self._stream_reconnect_streak
+                st.ever_decrypted = self._stream_ever_decrypted
 
     def _send_raw(self, pkt: bytes, label: str) -> bytes | None:
         """Send a packet and read one response (no reconnect logic)."""
